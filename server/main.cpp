@@ -22,16 +22,21 @@
 #define IDC_STATUS_LABEL 1002
 #define IDC_INFO_LABEL   1003
 #define IDC_CLIENT_LABEL 1004
+#define IDC_ACCESS_LABEL 1005
 
 #define WM_SERVER_STATUS (WM_APP + 1)
 #define WM_CLIENT_STATUS (WM_APP + 2)
+#define WM_ACCESS_STATUS (WM_APP + 3)
 
 static HWND g_statusLabel = nullptr;
 static HWND g_infoLabel = nullptr;
 static HWND g_clientLabel = nullptr;
+static HWND g_accessLabel = nullptr;
 static HWND g_powerButton = nullptr;
 
 static std::atomic_bool g_serverRunning{ false };
+static std::atomic_bool g_keyboardAccess{ false };
+static std::atomic_bool g_mouseAccess{ false };
 
 static std::thread g_discoveryThread;
 static std::thread g_controlThread;
@@ -64,6 +69,15 @@ static void post_client_status(HWND hwnd, const std::string& text) {
     PostMessageA(hwnd, WM_CLIENT_STATUS, 0, reinterpret_cast<LPARAM>(copy));
 }
 
+static void post_access_status(HWND hwnd) {
+    std::ostringstream out;
+    out << "Keyboard Access: " << (g_keyboardAccess.load() ? "ON" : "OFF")
+        << "    Mouse Access: " << (g_mouseAccess.load() ? "ON" : "OFF");
+
+    std::string* copy = new std::string(out.str());
+    PostMessageA(hwnd, WM_ACCESS_STATUS, 0, reinterpret_cast<LPARAM>(copy));
+}
+
 static bool send_all(SOCKET sock, const char* data, int total_bytes) {
     int sent_total = 0;
 
@@ -80,6 +94,49 @@ static bool send_all(SOCKET sock, const char* data, int total_bytes) {
     return true;
 }
 
+static std::string extract_value(const std::string& text, const std::string& key) {
+    std::string token = key + "=";
+    size_t start = text.find(token);
+
+    if (start == std::string::npos) {
+        return "";
+    }
+
+    start += token.size();
+
+    size_t end = text.find('|', start);
+
+    if (end == std::string::npos) {
+        return text.substr(start);
+    }
+
+    return text.substr(start, end - start);
+}
+
+static int to_int_safe(const std::string& value, int default_value = 0) {
+    if (value.empty()) {
+        return default_value;
+    }
+
+    return std::atoi(value.c_str());
+}
+
+static bool starts_with(const std::string& text, const std::string& prefix) {
+    return text.rfind(prefix, 0) == 0;
+}
+
+static int clamp_int(int value, int low, int high) {
+    if (value < low) {
+        return low;
+    }
+
+    if (value > high) {
+        return high;
+    }
+
+    return value;
+}
+
 static std::string make_discovery_reply() {
     std::ostringstream out;
 
@@ -92,13 +149,153 @@ static std::string make_discovery_reply() {
     return out.str();
 }
 
-static bool capture_screen_bgra(std::vector<unsigned char>& pixels, int& out_width, int& out_height) {
+static void inject_keyboard_event(int vk, bool down) {
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = static_cast<WORD>(vk);
+
+    if (!down) {
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+    }
+
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+static void inject_mouse_move(int x, int y, int screen_width, int screen_height) {
+    if (screen_width <= 1) {
+        screen_width = GetSystemMetrics(SM_CXSCREEN);
+    }
+
+    if (screen_height <= 1) {
+        screen_height = GetSystemMetrics(SM_CYSCREEN);
+    }
+
+    x = clamp_int(x, 0, screen_width - 1);
+    y = clamp_int(y, 0, screen_height - 1);
+
+    LONG absolute_x = static_cast<LONG>((static_cast<double>(x) * 65535.0) / (screen_width - 1));
+    LONG absolute_y = static_cast<LONG>((static_cast<double>(y) * 65535.0) / (screen_height - 1));
+
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dx = absolute_x;
+    input.mi.dy = absolute_y;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+static void inject_mouse_button(const std::string& button, bool down) {
+    DWORD flag = 0;
+
+    if (button == "L") {
+        flag = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+    } else if (button == "R") {
+        flag = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+    } else if (button == "M") {
+        flag = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+    }
+
+    if (flag == 0) {
+        return;
+    }
+
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = flag;
+
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+static void inject_mouse_wheel(int delta) {
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+    input.mi.mouseData = static_cast<DWORD>(delta);
+
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+static void process_control_line(HWND hwnd, const std::string& line) {
+    if (starts_with(line, rm::CONTROL_ACCESS_STATE)) {
+        int keyboard = to_int_safe(extract_value(line, "keyboard"));
+        int mouse = to_int_safe(extract_value(line, "mouse"));
+
+        g_keyboardAccess.store(keyboard == 1);
+        g_mouseAccess.store(mouse == 1);
+
+        post_access_status(hwnd);
+        return;
+    }
+
+    if (starts_with(line, rm::CONTROL_KEY_EVENT)) {
+        if (!g_keyboardAccess.load()) {
+            return;
+        }
+
+        int vk = to_int_safe(extract_value(line, "vk"));
+        int down = to_int_safe(extract_value(line, "down"));
+
+        if (vk > 0) {
+            inject_keyboard_event(vk, down == 1);
+        }
+
+        return;
+    }
+
+    if (starts_with(line, rm::CONTROL_MOUSE_MOVE)) {
+        if (!g_mouseAccess.load()) {
+            return;
+        }
+
+        int x = to_int_safe(extract_value(line, "x"));
+        int y = to_int_safe(extract_value(line, "y"));
+        int screen_w = to_int_safe(extract_value(line, "screen_w"));
+        int screen_h = to_int_safe(extract_value(line, "screen_h"));
+
+        inject_mouse_move(x, y, screen_w, screen_h);
+        return;
+    }
+
+    if (starts_with(line, rm::CONTROL_MOUSE_BUTTON)) {
+        if (!g_mouseAccess.load()) {
+            return;
+        }
+
+        std::string button = extract_value(line, "button");
+        int down = to_int_safe(extract_value(line, "down"));
+
+        inject_mouse_button(button, down == 1);
+        return;
+    }
+
+    if (starts_with(line, rm::CONTROL_MOUSE_WHEEL)) {
+        if (!g_mouseAccess.load()) {
+            return;
+        }
+
+        int delta = to_int_safe(extract_value(line, "delta"));
+        inject_mouse_wheel(delta);
+        return;
+    }
+}
+
+static bool capture_screen_bgra(
+    std::vector<unsigned char>& pixels,
+    int& out_width,
+    int& out_height,
+    int& out_screen_width,
+    int& out_screen_height
+) {
     int screen_width = GetSystemMetrics(SM_CXSCREEN);
     int screen_height = GetSystemMetrics(SM_CYSCREEN);
 
     if (screen_width <= 0 || screen_height <= 0) {
         return false;
     }
+
+    out_screen_width = screen_width;
+    out_screen_height = screen_height;
 
     int target_width = screen_width;
     int target_height = screen_height;
@@ -268,13 +465,18 @@ static void handle_connected_client(HWND hwnd, SOCKET client_socket, const std::
         g_controlClientSocket = client_socket;
     }
 
+    g_keyboardAccess.store(false);
+    g_mouseAccess.store(false);
+
     post_status(hwnd, "Status: ON - Viewer connected");
     post_client_status(hwnd, "Connected Viewer: " + client_ip);
+    post_access_status(hwnd);
 
     std::string ok = std::string(rm::CONTROL_OK) + "\n";
     send(client_socket, ok.c_str(), static_cast<int>(ok.size()), 0);
 
-    char buffer[1024]{};
+    char buffer[2048]{};
+    std::string pending;
 
     while (g_serverRunning.load()) {
         int received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
@@ -284,18 +486,42 @@ static void handle_connected_client(HWND hwnd, SOCKET client_socket, const std::
         }
 
         buffer[received] = '\0';
-        std::string message(buffer);
+        pending += buffer;
 
-        if (message.find(rm::CONTROL_DISCONNECT) != std::string::npos) {
-            break;
+        size_t newline_pos = std::string::npos;
+
+        while ((newline_pos = pending.find('\n')) != std::string::npos) {
+            std::string line = pending.substr(0, newline_pos);
+            pending.erase(0, newline_pos + 1);
+
+            if (line.find(rm::CONTROL_DISCONNECT) != std::string::npos) {
+                close_socket_safe(g_controlClientSocket);
+
+                g_keyboardAccess.store(false);
+                g_mouseAccess.store(false);
+
+                if (g_serverRunning.load()) {
+                    post_status(hwnd, "Status: ON - Waiting for viewers...");
+                    post_client_status(hwnd, "Connected Viewer: None");
+                    post_access_status(hwnd);
+                }
+
+                return;
+            }
+
+            process_control_line(hwnd, line);
         }
     }
 
     close_socket_safe(g_controlClientSocket);
 
+    g_keyboardAccess.store(false);
+    g_mouseAccess.store(false);
+
     if (g_serverRunning.load()) {
         post_status(hwnd, "Status: ON - Waiting for viewers...");
         post_client_status(hwnd, "Connected Viewer: None");
+        post_access_status(hwnd);
     }
 }
 
@@ -311,6 +537,7 @@ static void control_loop(HWND hwnd) {
     }
 
     BOOL reuse = TRUE;
+
     setsockopt(
         g_controlListenSocket,
         SOL_SOCKET,
@@ -394,6 +621,7 @@ static void video_loop(HWND hwnd) {
     }
 
     BOOL reuse = TRUE;
+
     setsockopt(
         g_videoListenSocket,
         SOL_SOCKET,
@@ -446,10 +674,13 @@ static void video_loop(HWND hwnd) {
 
         while (g_serverRunning.load()) {
             std::vector<unsigned char> pixels;
+
             int width = 0;
             int height = 0;
+            int screen_width = 0;
+            int screen_height = 0;
 
-            if (!capture_screen_bgra(pixels, width, height)) {
+            if (!capture_screen_bgra(pixels, width, height, screen_width, screen_height)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
@@ -458,6 +689,8 @@ static void video_loop(HWND hwnd) {
             header.magic = rm::FRAME_MAGIC;
             header.width = static_cast<uint32_t>(width);
             header.height = static_cast<uint32_t>(height);
+            header.screen_width = static_cast<uint32_t>(screen_width);
+            header.screen_height = static_cast<uint32_t>(screen_height);
             header.format = rm::FRAME_FORMAT_BGRA;
             header.payload_size = static_cast<uint32_t>(pixels.size());
             header.frame_id = frame_id++;
@@ -515,6 +748,7 @@ static void start_server(HWND hwnd) {
 
     SetWindowTextA(g_infoLabel, info.str().c_str());
     SetWindowTextA(g_clientLabel, "Connected Viewer: None");
+    SetWindowTextA(g_accessLabel, "Keyboard Access: OFF    Mouse Access: OFF");
 
     g_discoveryThread = std::thread(discovery_loop, hwnd);
     g_controlThread = std::thread(control_loop, hwnd);
@@ -546,9 +780,13 @@ static void stop_server(HWND hwnd) {
         g_videoThread.join();
     }
 
+    g_keyboardAccess.store(false);
+    g_mouseAccess.store(false);
+
     SetWindowTextA(g_powerButton, "Turn ON Server");
     SetWindowTextA(g_statusLabel, "Status: OFF");
     SetWindowTextA(g_clientLabel, "Connected Viewer: None");
+    SetWindowTextA(g_accessLabel, "Keyboard Access: OFF    Mouse Access: OFF");
 
     rm::cleanup_winsock();
 }
@@ -600,11 +838,22 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             nullptr
         );
 
+        g_accessLabel = CreateWindowA(
+            "STATIC",
+            "Keyboard Access: OFF    Mouse Access: OFF",
+            WS_CHILD | WS_VISIBLE,
+            30, 195, 330, 25,
+            hwnd,
+            reinterpret_cast<HMENU>(IDC_ACCESS_LABEL),
+            nullptr,
+            nullptr
+        );
+
         g_infoLabel = CreateWindowA(
             "STATIC",
             "PC Name: -\r\nIP: -\r\nDiscovery Port: 50500\r\nControl Port: 50510\r\nVideo Port: 50511",
             WS_CHILD | WS_VISIBLE,
-            30, 205, 330, 120,
+            30, 235, 330, 120,
             hwnd,
             reinterpret_cast<HMENU>(IDC_INFO_LABEL),
             nullptr,
@@ -646,6 +895,17 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         return 0;
     }
 
+    case WM_ACCESS_STATUS: {
+        std::string* text = reinterpret_cast<std::string*>(lparam);
+
+        if (text) {
+            SetWindowTextA(g_accessLabel, text->c_str());
+            delete text;
+        }
+
+        return 0;
+    }
+
     case WM_CLOSE:
         stop_server(hwnd);
         DestroyWindow(hwnd);
@@ -680,7 +940,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_cmd) {
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         400,
-        390,
+        420,
         nullptr,
         nullptr,
         instance,

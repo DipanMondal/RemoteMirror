@@ -5,8 +5,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <windowsx.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -24,6 +24,8 @@
 #define IDC_STATUS_LABEL   2004
 
 #define HOTKEY_DISCONNECT  9001
+#define HOTKEY_KEYBOARD    9002
+#define HOTKEY_MOUSE       9003
 
 #define WM_ADD_SERVER       (WM_APP + 10)
 #define WM_DISCOVERY_DONE   (WM_APP + 11)
@@ -39,6 +41,8 @@ static HWND g_connectButton = nullptr;
 static std::atomic_bool g_discoveryRunning{ false };
 static std::atomic_bool g_connected{ false };
 static std::atomic_bool g_connecting{ false };
+static std::atomic_bool g_keyboardAccess{ false };
+static std::atomic_bool g_mouseAccess{ false };
 
 static std::thread g_discoveryThread;
 static std::thread g_connectionThread;
@@ -53,6 +57,10 @@ static std::mutex g_frameMutex;
 static std::vector<unsigned char> g_latestFrame;
 static int g_frameWidth = 0;
 static int g_frameHeight = 0;
+static int g_remoteScreenWidth = 0;
+static int g_remoteScreenHeight = 0;
+
+static RECT g_lastVideoRect{ 10, 45, 890, 590 };
 
 struct ServerInfo {
     std::string name;
@@ -60,6 +68,18 @@ struct ServerInfo {
     std::string display;
     std::string raw;
 };
+
+static int clamp_int(int value, int low, int high) {
+    if (value < low) {
+        return low;
+    }
+
+    if (value > high) {
+        return high;
+    }
+
+    return value;
+}
 
 static void post_status(HWND hwnd, const std::string& text) {
     std::string* copy = new std::string(text);
@@ -80,6 +100,33 @@ static bool recv_all(SOCKET sock, char* data, int total_bytes) {
     }
 
     return true;
+}
+
+static void send_control_line(const std::string& line) {
+    std::lock_guard<std::mutex> lock(g_socketMutex);
+
+    if (g_controlSocket == INVALID_SOCKET) {
+        return;
+    }
+
+    std::string message = line + "\n";
+
+    send(
+        g_controlSocket,
+        message.c_str(),
+        static_cast<int>(message.size()),
+        0
+    );
+}
+
+static void send_access_state() {
+    std::ostringstream out;
+
+    out << rm::CONTROL_ACCESS_STATE
+        << "|keyboard=" << (g_keyboardAccess.load() ? 1 : 0)
+        << "|mouse=" << (g_mouseAccess.load() ? 1 : 0);
+
+    send_control_line(out.str());
 }
 
 static void close_control_socket_safe() {
@@ -281,26 +328,17 @@ static void disconnect_from_server(HWND hwnd) {
         return;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(g_socketMutex);
-
-        if (g_controlSocket != INVALID_SOCKET) {
-            std::string disconnect_message = std::string(rm::CONTROL_DISCONNECT) + "\n";
-
-            send(
-                g_controlSocket,
-                disconnect_message.c_str(),
-                static_cast<int>(disconnect_message.size()),
-                0
-            );
-        }
-    }
+    send_control_line(rm::CONTROL_DISCONNECT);
 
     g_connected.store(false);
     g_connecting.store(false);
+    g_keyboardAccess.store(false);
+    g_mouseAccess.store(false);
 
     close_video_socket_safe();
     close_control_socket_safe();
+
+    ReleaseCapture();
 
     post_status(hwnd, "Status: Disconnected");
     PostMessageA(hwnd, WM_CONNECTION_STATE, 0, 0);
@@ -335,7 +373,7 @@ static void video_receive_loop(HWND hwnd, std::string ip) {
         return;
     }
 
-    post_status(hwnd, "Status: Connected - receiving screen feed | Press Alt+X to disconnect");
+    post_status(hwnd, "Status: Connected - receiving screen feed | Alt+K Keyboard | Alt+M Mouse | Alt+X Disconnect");
 
     while (g_connected.load()) {
         rm::FrameHeader header{};
@@ -375,6 +413,8 @@ static void video_receive_loop(HWND hwnd, std::string ip) {
             g_latestFrame = std::move(payload);
             g_frameWidth = static_cast<int>(header.width);
             g_frameHeight = static_cast<int>(header.height);
+            g_remoteScreenWidth = static_cast<int>(header.screen_width);
+            g_remoteScreenHeight = static_cast<int>(header.screen_height);
         }
 
         PostMessageA(hwnd, WM_NEW_FRAME, 0, 0);
@@ -461,8 +501,12 @@ static void connection_loop(HWND hwnd, std::string ip) {
 
     g_connected.store(true);
     g_connecting.store(false);
+    g_keyboardAccess.store(false);
+    g_mouseAccess.store(false);
 
     PostMessageA(hwnd, WM_CONNECTION_STATE, 1, 0);
+
+    send_access_state();
 
     if (g_videoThread.joinable()) {
         g_videoThread.join();
@@ -480,6 +524,8 @@ static void connection_loop(HWND hwnd, std::string ip) {
 
     g_connected.store(false);
     g_connecting.store(false);
+    g_keyboardAccess.store(false);
+    g_mouseAccess.store(false);
 
     close_control_socket_safe();
     close_video_socket_safe();
@@ -550,6 +596,89 @@ static RECT calculate_fit_rect(const RECT& bounds, int image_width, int image_he
     return result;
 }
 
+static bool point_inside_rect(const RECT& rect, int x, int y) {
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
+static void send_mouse_move_from_point(int x, int y) {
+    if (!g_connected.load() || !g_mouseAccess.load()) {
+        return;
+    }
+
+    RECT rect = g_lastVideoRect;
+
+    int rect_width = rect.right - rect.left;
+    int rect_height = rect.bottom - rect.top;
+
+    if (rect_width <= 1 || rect_height <= 1) {
+        return;
+    }
+
+    int remote_w = g_remoteScreenWidth;
+    int remote_h = g_remoteScreenHeight;
+
+    if (remote_w <= 1 || remote_h <= 1) {
+        return;
+    }
+
+    int local_x = clamp_int(x - rect.left, 0, rect_width - 1);
+    int local_y = clamp_int(y - rect.top, 0, rect_height - 1);
+
+    int remote_x = static_cast<int>((static_cast<double>(local_x) / (rect_width - 1)) * (remote_w - 1));
+    int remote_y = static_cast<int>((static_cast<double>(local_y) / (rect_height - 1)) * (remote_h - 1));
+
+    std::ostringstream out;
+
+    out << rm::CONTROL_MOUSE_MOVE
+        << "|x=" << remote_x
+        << "|y=" << remote_y
+        << "|screen_w=" << remote_w
+        << "|screen_h=" << remote_h;
+
+    send_control_line(out.str());
+}
+
+static void send_mouse_button(const std::string& button, bool down) {
+    if (!g_connected.load() || !g_mouseAccess.load()) {
+        return;
+    }
+
+    std::ostringstream out;
+
+    out << rm::CONTROL_MOUSE_BUTTON
+        << "|button=" << button
+        << "|down=" << (down ? 1 : 0);
+
+    send_control_line(out.str());
+}
+
+static void send_mouse_wheel(int delta) {
+    if (!g_connected.load() || !g_mouseAccess.load()) {
+        return;
+    }
+
+    std::ostringstream out;
+
+    out << rm::CONTROL_MOUSE_WHEEL
+        << "|delta=" << delta;
+
+    send_control_line(out.str());
+}
+
+static void send_key_event(WPARAM vk, LPARAM, bool down) {
+    if (!g_connected.load() || !g_keyboardAccess.load()) {
+        return;
+    }
+
+    std::ostringstream out;
+
+    out << rm::CONTROL_KEY_EVENT
+        << "|vk=" << static_cast<int>(vk)
+        << "|down=" << (down ? 1 : 0);
+
+    send_control_line(out.str());
+}
+
 static void paint_video(HWND hwnd, HDC hdc) {
     RECT client{};
     GetClientRect(hwnd, &client);
@@ -586,10 +715,13 @@ static void paint_video(HWND hwnd, HDC hdc) {
             &video_bounds,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE
         );
+
+        g_lastVideoRect = video_bounds;
         return;
     }
 
     RECT draw_rect = calculate_fit_rect(video_bounds, width, height);
+    g_lastVideoRect = draw_rect;
 
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -615,10 +747,14 @@ static void paint_video(HWND hwnd, HDC hdc) {
         SRCCOPY
     );
 
-    std::string indicator = "K: OFF   M: OFF   Alt+X: Disconnect";
+    std::ostringstream indicator;
+
+    indicator << "K: " << (g_keyboardAccess.load() ? "ON" : "OFF")
+              << "   M: " << (g_mouseAccess.load() ? "ON" : "OFF")
+              << "   Alt+X: Disconnect";
 
     RECT indicator_rect{};
-    indicator_rect.left = client.right - 300;
+    indicator_rect.left = client.right - 330;
     indicator_rect.top = 10;
     indicator_rect.right = client.right - 10;
     indicator_rect.bottom = 35;
@@ -626,11 +762,39 @@ static void paint_video(HWND hwnd, HDC hdc) {
     SetTextColor(hdc, RGB(0, 0, 0));
     DrawTextA(
         hdc,
-        indicator.c_str(),
+        indicator.str().c_str(),
         -1,
         &indicator_rect,
         DT_RIGHT | DT_VCENTER | DT_SINGLELINE
     );
+}
+
+static void toggle_keyboard_access(HWND hwnd) {
+    if (!g_connected.load()) {
+        return;
+    }
+
+    g_keyboardAccess.store(!g_keyboardAccess.load());
+
+    send_access_state();
+
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+static void toggle_mouse_access(HWND hwnd) {
+    if (!g_connected.load()) {
+        return;
+    }
+
+    g_mouseAccess.store(!g_mouseAccess.load());
+
+    if (!g_mouseAccess.load()) {
+        ReleaseCapture();
+    }
+
+    send_access_state();
+
+    InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -684,7 +848,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             "STATIC",
             "Status: Click Refresh Servers",
             WS_CHILD | WS_VISIBLE,
-            30, 310, 500, 25,
+            30, 310, 800, 25,
             hwnd,
             reinterpret_cast<HMENU>(IDC_STATUS_LABEL),
             nullptr,
@@ -692,6 +856,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         );
 
         RegisterHotKey(hwnd, HOTKEY_DISCONNECT, MOD_ALT, 'X');
+        RegisterHotKey(hwnd, HOTKEY_KEYBOARD, MOD_ALT, 'K');
+        RegisterHotKey(hwnd, HOTKEY_MOUSE, MOD_ALT, 'M');
 
         return 0;
 
@@ -709,9 +875,109 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_HOTKEY:
         if (wparam == HOTKEY_DISCONNECT) {
             disconnect_from_server(hwnd);
+        } else if (wparam == HOTKEY_KEYBOARD) {
+            toggle_keyboard_access(hwnd);
+        } else if (wparam == HOTKEY_MOUSE) {
+            toggle_mouse_access(hwnd);
         }
 
         return 0;
+
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        send_key_event(wparam, lparam, true);
+        return g_keyboardAccess.load() ? 0 : DefWindowProcA(hwnd, msg, wparam, lparam);
+
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        send_key_event(wparam, lparam, false);
+        return g_keyboardAccess.load() ? 0 : DefWindowProcA(hwnd, msg, wparam, lparam);
+
+    case WM_MOUSEMOVE:
+        if (g_connected.load() && g_mouseAccess.load()) {
+            int x = GET_X_LPARAM(lparam);
+            int y = GET_Y_LPARAM(lparam);
+
+            if (point_inside_rect(g_lastVideoRect, x, y) || GetCapture() == hwnd) {
+                send_mouse_move_from_point(x, y);
+            }
+
+            return 0;
+        }
+
+        break;
+
+    case WM_LBUTTONDOWN:
+        if (g_connected.load() && g_mouseAccess.load()) {
+            SetFocus(hwnd);
+            SetCapture(hwnd);
+            send_mouse_move_from_point(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+            send_mouse_button("L", true);
+            return 0;
+        }
+
+        break;
+
+    case WM_LBUTTONUP:
+        if (g_connected.load() && g_mouseAccess.load()) {
+            send_mouse_move_from_point(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+            send_mouse_button("L", false);
+            ReleaseCapture();
+            return 0;
+        }
+
+        break;
+
+    case WM_RBUTTONDOWN:
+        if (g_connected.load() && g_mouseAccess.load()) {
+            SetFocus(hwnd);
+            SetCapture(hwnd);
+            send_mouse_move_from_point(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+            send_mouse_button("R", true);
+            return 0;
+        }
+
+        break;
+
+    case WM_RBUTTONUP:
+        if (g_connected.load() && g_mouseAccess.load()) {
+            send_mouse_move_from_point(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+            send_mouse_button("R", false);
+            ReleaseCapture();
+            return 0;
+        }
+
+        break;
+
+    case WM_MBUTTONDOWN:
+        if (g_connected.load() && g_mouseAccess.load()) {
+            SetFocus(hwnd);
+            SetCapture(hwnd);
+            send_mouse_move_from_point(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+            send_mouse_button("M", true);
+            return 0;
+        }
+
+        break;
+
+    case WM_MBUTTONUP:
+        if (g_connected.load() && g_mouseAccess.load()) {
+            send_mouse_move_from_point(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+            send_mouse_button("M", false);
+            ReleaseCapture();
+            return 0;
+        }
+
+        break;
+
+    case WM_MOUSEWHEEL:
+        if (g_connected.load() && g_mouseAccess.load()) {
+            int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+            send_mouse_wheel(delta);
+            return 0;
+        }
+
+        break;
 
     case WM_ADD_SERVER: {
         ServerInfo* info = reinterpret_cast<ServerInfo*>(lparam);
@@ -772,6 +1038,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
 
+    case WM_SIZE:
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC hdc = BeginPaint(hwnd, &ps);
@@ -804,6 +1074,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         clear_server_list();
 
         UnregisterHotKey(hwnd, HOTKEY_DISCONNECT);
+        UnregisterHotKey(hwnd, HOTKEY_KEYBOARD);
+        UnregisterHotKey(hwnd, HOTKEY_MOUSE);
 
         DestroyWindow(hwnd);
         return 0;
@@ -828,6 +1100,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         clear_server_list();
 
         UnregisterHotKey(hwnd, HOTKEY_DISCONNECT);
+        UnregisterHotKey(hwnd, HOTKEY_KEYBOARD);
+        UnregisterHotKey(hwnd, HOTKEY_MOUSE);
 
         PostQuitMessage(0);
         return 0;
