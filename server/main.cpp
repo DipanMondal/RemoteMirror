@@ -5,6 +5,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <wincodec.h>
 
 #include <atomic>
 #include <chrono>
@@ -92,6 +93,188 @@ static bool send_all(SOCKET sock, const char* data, int total_bytes) {
     }
 
     return true;
+}
+
+template <typename T>
+static void safe_release(T*& ptr) {
+    if (ptr) {
+        ptr->Release();
+        ptr = nullptr;
+    }
+}
+
+static bool encode_bgra_to_jpeg(
+    const std::vector<unsigned char>& bgra_pixels,
+    int width,
+    int height,
+    float quality,
+    std::vector<unsigned char>& jpeg_output
+) {
+    if (bgra_pixels.empty() || width <= 0 || height <= 0) {
+        return false;
+    }
+
+    HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool should_uninitialize_com = SUCCEEDED(co_hr);
+
+    if (FAILED(co_hr) && co_hr != RPC_E_CHANGED_MODE) {
+        return false;
+    }
+
+    bool success = false;
+
+    IWICImagingFactory* factory = nullptr;
+    IStream* stream = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IPropertyBag2* property_bag = nullptr;
+
+    do {
+        HRESULT hr = CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory)
+        );
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = CreateStreamOnHGlobal(nullptr, TRUE, &stream);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = encoder->CreateNewFrame(&frame, &property_bag);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        if (property_bag) {
+            PROPBAG2 option{};
+            option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+
+            VARIANT value{};
+            VariantInit(&value);
+            value.vt = VT_R4;
+            value.fltVal = quality;
+
+            property_bag->Write(1, &option, &value);
+            VariantClear(&value);
+        }
+
+        hr = frame->Initialize(property_bag);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = frame->SetSize(width, height);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        WICPixelFormatGUID pixel_format = GUID_WICPixelFormat24bppBGR;
+
+        hr = frame->SetPixelFormat(&pixel_format);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        std::vector<unsigned char> bgr_pixels;
+        bgr_pixels.resize(static_cast<size_t>(width) * height * 3);
+
+        for (int i = 0; i < width * height; ++i) {
+            bgr_pixels[i * 3 + 0] = bgra_pixels[i * 4 + 0];
+            bgr_pixels[i * 3 + 1] = bgra_pixels[i * 4 + 1];
+            bgr_pixels[i * 3 + 2] = bgra_pixels[i * 4 + 2];
+        }
+
+        UINT stride = static_cast<UINT>(width * 3);
+        UINT image_size = static_cast<UINT>(bgr_pixels.size());
+
+        hr = frame->WritePixels(
+            static_cast<UINT>(height),
+            stride,
+            image_size,
+            bgr_pixels.data()
+        );
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = frame->Commit();
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = encoder->Commit();
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        STATSTG stat{};
+        hr = stream->Stat(&stat, STATFLAG_NONAME);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        HGLOBAL global_memory = nullptr;
+        hr = GetHGlobalFromStream(stream, &global_memory);
+
+        if (FAILED(hr) || !global_memory) {
+            break;
+        }
+
+        SIZE_T jpeg_size = static_cast<SIZE_T>(stat.cbSize.QuadPart);
+
+        void* memory_ptr = GlobalLock(global_memory);
+
+        if (!memory_ptr) {
+            break;
+        }
+
+        jpeg_output.resize(jpeg_size);
+        std::memcpy(jpeg_output.data(), memory_ptr, jpeg_size);
+
+        GlobalUnlock(global_memory);
+
+        success = true;
+
+    } while (false);
+
+    safe_release(property_bag);
+    safe_release(frame);
+    safe_release(encoder);
+    safe_release(stream);
+    safe_release(factory);
+
+    if (should_uninitialize_com) {
+        CoUninitialize();
+    }
+
+    return success;
 }
 
 static std::string extract_value(const std::string& text, const std::string& key) {
@@ -685,37 +868,52 @@ static void video_loop(HWND hwnd) {
                 continue;
             }
 
-            rm::FrameHeader header{};
-            header.magic = rm::FRAME_MAGIC;
-            header.width = static_cast<uint32_t>(width);
-            header.height = static_cast<uint32_t>(height);
-            header.screen_width = static_cast<uint32_t>(screen_width);
-            header.screen_height = static_cast<uint32_t>(screen_height);
-            header.format = rm::FRAME_FORMAT_BGRA;
-            header.payload_size = static_cast<uint32_t>(pixels.size());
-            header.frame_id = frame_id++;
+            std::vector<unsigned char> jpeg_frame;
 
-            bool header_ok = send_all(
-                client_socket,
-                reinterpret_cast<const char*>(&header),
-                sizeof(header)
-            );
+			bool jpeg_ok = encode_bgra_to_jpeg(
+				pixels,
+				width,
+				height,
+				0.55f,
+				jpeg_frame
+			);
 
-            if (!header_ok) {
-                break;
-            }
+			if (!jpeg_ok || jpeg_frame.empty()) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				continue;
+			}
 
-            bool payload_ok = send_all(
-                client_socket,
-                reinterpret_cast<const char*>(pixels.data()),
-                static_cast<int>(pixels.size())
-            );
+			rm::FrameHeader header{};
+			header.magic = rm::FRAME_MAGIC;
+			header.width = static_cast<uint32_t>(width);
+			header.height = static_cast<uint32_t>(height);
+			header.screen_width = static_cast<uint32_t>(screen_width);
+			header.screen_height = static_cast<uint32_t>(screen_height);
+			header.format = rm::FRAME_FORMAT_JPEG;
+			header.payload_size = static_cast<uint32_t>(jpeg_frame.size());
+			header.frame_id = frame_id++;
 
-            if (!payload_ok) {
-                break;
-            }
+			bool header_ok = send_all(
+				client_socket,
+				reinterpret_cast<const char*>(&header),
+				sizeof(header)
+			);
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			if (!header_ok) {
+				break;
+			}
+
+			bool payload_ok = send_all(
+				client_socket,
+				reinterpret_cast<const char*>(jpeg_frame.data()),
+				static_cast<int>(jpeg_frame.size())
+			);
+
+			if (!payload_ok) {
+				break;
+			}
+
+			std::this_thread::sleep_for(std::chrono::milliseconds(66));
         }
 
         close_socket_safe(g_videoClientSocket);

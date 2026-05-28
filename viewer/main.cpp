@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
+#include <wincodec.h>
 
 #include <atomic>
 #include <cstring>
@@ -100,6 +101,147 @@ static bool recv_all(SOCKET sock, char* data, int total_bytes) {
     }
 
     return true;
+}
+
+template <typename T>
+static void safe_release(T*& ptr) {
+    if (ptr) {
+        ptr->Release();
+        ptr = nullptr;
+    }
+}
+
+static bool decode_jpeg_to_bgra(
+    const std::vector<unsigned char>& jpeg_data,
+    std::vector<unsigned char>& bgra_output,
+    int& out_width,
+    int& out_height
+) {
+    if (jpeg_data.empty()) {
+        return false;
+    }
+
+    HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool should_uninitialize_com = SUCCEEDED(co_hr);
+
+    if (FAILED(co_hr) && co_hr != RPC_E_CHANGED_MODE) {
+        return false;
+    }
+
+    bool success = false;
+
+    IWICImagingFactory* factory = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+
+    do {
+        HRESULT hr = CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory)
+        );
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = factory->CreateStream(&stream);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = stream->InitializeFromMemory(
+            const_cast<BYTE*>(jpeg_data.data()),
+            static_cast<DWORD>(jpeg_data.size())
+        );
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = factory->CreateDecoderFromStream(
+            stream,
+            nullptr,
+            WICDecodeMetadataCacheOnLoad,
+            &decoder
+        );
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = decoder->GetFrame(0, &frame);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        UINT width = 0;
+        UINT height = 0;
+
+        hr = frame->GetSize(&width, &height);
+
+        if (FAILED(hr) || width == 0 || height == 0) {
+            break;
+        }
+
+        hr = factory->CreateFormatConverter(&converter);
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        hr = converter->Initialize(
+            frame,
+            GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            nullptr,
+            0.0,
+            WICBitmapPaletteTypeCustom
+        );
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        bgra_output.resize(static_cast<size_t>(width) * height * 4);
+
+        UINT stride = width * 4;
+        UINT image_size = static_cast<UINT>(bgra_output.size());
+
+        hr = converter->CopyPixels(
+            nullptr,
+            stride,
+            image_size,
+            bgra_output.data()
+        );
+
+        if (FAILED(hr)) {
+            break;
+        }
+
+        out_width = static_cast<int>(width);
+        out_height = static_cast<int>(height);
+
+        success = true;
+
+    } while (false);
+
+    safe_release(converter);
+    safe_release(frame);
+    safe_release(decoder);
+    safe_release(stream);
+    safe_release(factory);
+
+    if (should_uninitialize_com) {
+        CoUninitialize();
+    }
+
+    return success;
 }
 
 static void send_control_line(const std::string& line) {
@@ -389,12 +531,12 @@ static void video_receive_loop(HWND hwnd, std::string ip) {
         }
 
         if (header.magic != rm::FRAME_MAGIC ||
-            header.format != rm::FRAME_FORMAT_BGRA ||
-            header.width == 0 ||
-            header.height == 0 ||
-            header.payload_size == 0) {
-            break;
-        }
+			header.format != rm::FRAME_FORMAT_JPEG ||
+			header.width == 0 ||
+			header.height == 0 ||
+			header.payload_size == 0) {
+			break;
+		}
 
         std::vector<unsigned char> payload(header.payload_size);
 
@@ -408,16 +550,31 @@ static void video_receive_loop(HWND hwnd, std::string ip) {
             break;
         }
 
-        {
-            std::lock_guard<std::mutex> lock(g_frameMutex);
-            g_latestFrame = std::move(payload);
-            g_frameWidth = static_cast<int>(header.width);
-            g_frameHeight = static_cast<int>(header.height);
-            g_remoteScreenWidth = static_cast<int>(header.screen_width);
-            g_remoteScreenHeight = static_cast<int>(header.screen_height);
-        }
+        std::vector<unsigned char> decoded_bgra;
+		int decoded_width = 0;
+		int decoded_height = 0;
 
-        PostMessageA(hwnd, WM_NEW_FRAME, 0, 0);
+		bool decode_ok = decode_jpeg_to_bgra(
+			payload,
+			decoded_bgra,
+			decoded_width,
+			decoded_height
+		);
+
+		if (!decode_ok || decoded_bgra.empty()) {
+			continue;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(g_frameMutex);
+			g_latestFrame = std::move(decoded_bgra);
+			g_frameWidth = decoded_width;
+			g_frameHeight = decoded_height;
+			g_remoteScreenWidth = static_cast<int>(header.screen_width);
+			g_remoteScreenHeight = static_cast<int>(header.screen_height);
+		}
+
+		PostMessageA(hwnd, WM_NEW_FRAME, 0, 0);
     }
 
     close_video_socket_safe();

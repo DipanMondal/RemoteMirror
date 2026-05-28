@@ -25,7 +25,9 @@ constexpr uint16_t CONTROL_PORT   = 50510;
 constexpr uint16_t VIDEO_PORT     = 50511;
 
 constexpr uint32_t FRAME_MAGIC = 0x524D4652;
+
 constexpr uint32_t FRAME_FORMAT_BGRA = 1;
+constexpr uint32_t FRAME_FORMAT_JPEG = 2;
 
 #pragma pack(push, 1)
 struct FrameHeader {
