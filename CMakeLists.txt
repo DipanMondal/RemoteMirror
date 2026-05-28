@@ -24,6 +24,8 @@ add_executable(RemoteMirrorServer WIN32
 
 target_link_libraries(RemoteMirrorServer PRIVATE
     RemoteMirrorCommon
+    user32
+    gdi32
 )
 
 add_executable(RemoteMirrorViewer WIN32
@@ -32,4 +34,6 @@ add_executable(RemoteMirrorViewer WIN32
 
 target_link_libraries(RemoteMirrorViewer PRIVATE
     RemoteMirrorCommon
+    user32
+    gdi32
 )

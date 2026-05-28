@@ -6,12 +6,14 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "protocol.h"
 #include "net_utils.h"
@@ -23,9 +25,11 @@
 
 #define HOTKEY_DISCONNECT  9001
 
-#define WM_ADD_SERVER      (WM_APP + 10)
-#define WM_DISCOVERY_DONE  (WM_APP + 11)
-#define WM_VIEWER_STATUS   (WM_APP + 12)
+#define WM_ADD_SERVER       (WM_APP + 10)
+#define WM_DISCOVERY_DONE   (WM_APP + 11)
+#define WM_VIEWER_STATUS    (WM_APP + 12)
+#define WM_CONNECTION_STATE (WM_APP + 13)
+#define WM_NEW_FRAME        (WM_APP + 14)
 
 static HWND g_serverList = nullptr;
 static HWND g_statusLabel = nullptr;
@@ -38,9 +42,17 @@ static std::atomic_bool g_connecting{ false };
 
 static std::thread g_discoveryThread;
 static std::thread g_connectionThread;
+static std::thread g_videoThread;
 
 static SOCKET g_controlSocket = INVALID_SOCKET;
+static SOCKET g_videoSocket = INVALID_SOCKET;
+
 static std::mutex g_socketMutex;
+static std::mutex g_frameMutex;
+
+static std::vector<unsigned char> g_latestFrame;
+static int g_frameWidth = 0;
+static int g_frameHeight = 0;
 
 struct ServerInfo {
     std::string name;
@@ -54,6 +66,22 @@ static void post_status(HWND hwnd, const std::string& text) {
     PostMessageA(hwnd, WM_VIEWER_STATUS, 0, reinterpret_cast<LPARAM>(copy));
 }
 
+static bool recv_all(SOCKET sock, char* data, int total_bytes) {
+    int received_total = 0;
+
+    while (received_total < total_bytes) {
+        int received = recv(sock, data + received_total, total_bytes - received_total, 0);
+
+        if (received <= 0) {
+            return false;
+        }
+
+        received_total += received;
+    }
+
+    return true;
+}
+
 static void close_control_socket_safe() {
     std::lock_guard<std::mutex> lock(g_socketMutex);
 
@@ -61,6 +89,16 @@ static void close_control_socket_safe() {
         shutdown(g_controlSocket, SD_BOTH);
         closesocket(g_controlSocket);
         g_controlSocket = INVALID_SOCKET;
+    }
+}
+
+static void close_video_socket_safe() {
+    std::lock_guard<std::mutex> lock(g_socketMutex);
+
+    if (g_videoSocket != INVALID_SOCKET) {
+        shutdown(g_videoSocket, SD_BOTH);
+        closesocket(g_videoSocket);
+        g_videoSocket = INVALID_SOCKET;
     }
 }
 
@@ -232,6 +270,12 @@ static void finish_discovery() {
     SetWindowTextA(g_statusLabel, "Status: Discovery complete");
 }
 
+static void show_connection_ui(bool connected) {
+    ShowWindow(g_refreshButton, connected ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_connectButton, connected ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_serverList, connected ? SW_HIDE : SW_SHOW);
+}
+
 static void disconnect_from_server(HWND hwnd) {
     if (!g_connected.load() && !g_connecting.load()) {
         return;
@@ -242,23 +286,101 @@ static void disconnect_from_server(HWND hwnd) {
 
         if (g_controlSocket != INVALID_SOCKET) {
             std::string disconnect_message = std::string(rm::CONTROL_DISCONNECT) + "\n";
+
             send(
                 g_controlSocket,
                 disconnect_message.c_str(),
                 static_cast<int>(disconnect_message.size()),
                 0
             );
-
-            shutdown(g_controlSocket, SD_BOTH);
-            closesocket(g_controlSocket);
-            g_controlSocket = INVALID_SOCKET;
         }
     }
 
     g_connected.store(false);
     g_connecting.store(false);
 
+    close_video_socket_safe();
+    close_control_socket_safe();
+
     post_status(hwnd, "Status: Disconnected");
+    PostMessageA(hwnd, WM_CONNECTION_STATE, 0, 0);
+}
+
+static void video_receive_loop(HWND hwnd, std::string ip) {
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+    if (sock == INVALID_SOCKET) {
+        post_status(hwnd, "Status: Failed to create video socket");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_socketMutex);
+        g_videoSocket = sock;
+    }
+
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(rm::VIDEO_PORT);
+
+    if (inet_pton(AF_INET, ip.c_str(), &server_addr.sin_addr) != 1) {
+        close_video_socket_safe();
+        post_status(hwnd, "Status: Invalid video server IP");
+        return;
+    }
+
+    if (connect(sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == SOCKET_ERROR) {
+        close_video_socket_safe();
+        post_status(hwnd, "Status: Video connection failed");
+        return;
+    }
+
+    post_status(hwnd, "Status: Connected - receiving screen feed | Press Alt+X to disconnect");
+
+    while (g_connected.load()) {
+        rm::FrameHeader header{};
+
+        bool header_ok = recv_all(
+            sock,
+            reinterpret_cast<char*>(&header),
+            sizeof(header)
+        );
+
+        if (!header_ok) {
+            break;
+        }
+
+        if (header.magic != rm::FRAME_MAGIC ||
+            header.format != rm::FRAME_FORMAT_BGRA ||
+            header.width == 0 ||
+            header.height == 0 ||
+            header.payload_size == 0) {
+            break;
+        }
+
+        std::vector<unsigned char> payload(header.payload_size);
+
+        bool payload_ok = recv_all(
+            sock,
+            reinterpret_cast<char*>(payload.data()),
+            static_cast<int>(payload.size())
+        );
+
+        if (!payload_ok) {
+            break;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_frameMutex);
+            g_latestFrame = std::move(payload);
+            g_frameWidth = static_cast<int>(header.width);
+            g_frameHeight = static_cast<int>(header.height);
+        }
+
+        PostMessageA(hwnd, WM_NEW_FRAME, 0, 0);
+    }
+
+    close_video_socket_safe();
 }
 
 static void connection_loop(HWND hwnd, std::string ip) {
@@ -340,7 +462,13 @@ static void connection_loop(HWND hwnd, std::string ip) {
     g_connected.store(true);
     g_connecting.store(false);
 
-    post_status(hwnd, "Status: Connected to " + ip + "    |    Press Alt+X to disconnect");
+    PostMessageA(hwnd, WM_CONNECTION_STATE, 1, 0);
+
+    if (g_videoThread.joinable()) {
+        g_videoThread.join();
+    }
+
+    g_videoThread = std::thread(video_receive_loop, hwnd, ip);
 
     while (g_connected.load()) {
         int server_msg = recv(sock, buffer, sizeof(buffer) - 1, 0);
@@ -350,12 +478,18 @@ static void connection_loop(HWND hwnd, std::string ip) {
         }
     }
 
-    close_control_socket_safe();
-
     g_connected.store(false);
     g_connecting.store(false);
 
+    close_control_socket_safe();
+    close_video_socket_safe();
+
+    if (g_videoThread.joinable()) {
+        g_videoThread.join();
+    }
+
     post_status(hwnd, "Status: Disconnected");
+    PostMessageA(hwnd, WM_CONNECTION_STATE, 0, 0);
 
     rm::cleanup_winsock();
 }
@@ -389,6 +523,114 @@ static void connect_to_selected_server(HWND hwnd) {
     }
 
     g_connectionThread = std::thread(connection_loop, hwnd, info->ip);
+}
+
+static RECT calculate_fit_rect(const RECT& bounds, int image_width, int image_height) {
+    RECT result = bounds;
+
+    if (image_width <= 0 || image_height <= 0) {
+        return result;
+    }
+
+    int bounds_width = bounds.right - bounds.left;
+    int bounds_height = bounds.bottom - bounds.top;
+
+    double scale_x = static_cast<double>(bounds_width) / image_width;
+    double scale_y = static_cast<double>(bounds_height) / image_height;
+    double scale = (scale_x < scale_y) ? scale_x : scale_y;
+
+    int draw_width = static_cast<int>(image_width * scale);
+    int draw_height = static_cast<int>(image_height * scale);
+
+    result.left = bounds.left + (bounds_width - draw_width) / 2;
+    result.top = bounds.top + (bounds_height - draw_height) / 2;
+    result.right = result.left + draw_width;
+    result.bottom = result.top + draw_height;
+
+    return result;
+}
+
+static void paint_video(HWND hwnd, HDC hdc) {
+    RECT client{};
+    GetClientRect(hwnd, &client);
+
+    RECT video_bounds{};
+    video_bounds.left = 10;
+    video_bounds.top = 45;
+    video_bounds.right = client.right - 10;
+    video_bounds.bottom = client.bottom - 10;
+
+    HBRUSH black_brush = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(hdc, &video_bounds, black_brush);
+    DeleteObject(black_brush);
+
+    std::vector<unsigned char> frame_copy;
+    int width = 0;
+    int height = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_frameMutex);
+        frame_copy = g_latestFrame;
+        width = g_frameWidth;
+        height = g_frameHeight;
+    }
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    if (frame_copy.empty() || width <= 0 || height <= 0) {
+        SetTextColor(hdc, RGB(255, 255, 255));
+        DrawTextA(
+            hdc,
+            "Waiting for video frames...",
+            -1,
+            &video_bounds,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE
+        );
+        return;
+    }
+
+    RECT draw_rect = calculate_fit_rect(video_bounds, width, height);
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    StretchDIBits(
+        hdc,
+        draw_rect.left,
+        draw_rect.top,
+        draw_rect.right - draw_rect.left,
+        draw_rect.bottom - draw_rect.top,
+        0,
+        0,
+        width,
+        height,
+        frame_copy.data(),
+        &bmi,
+        DIB_RGB_COLORS,
+        SRCCOPY
+    );
+
+    std::string indicator = "K: OFF   M: OFF   Alt+X: Disconnect";
+
+    RECT indicator_rect{};
+    indicator_rect.left = client.right - 300;
+    indicator_rect.top = 10;
+    indicator_rect.right = client.right - 10;
+    indicator_rect.bottom = 35;
+
+    SetTextColor(hdc, RGB(0, 0, 0));
+    DrawTextA(
+        hdc,
+        indicator.c_str(),
+        -1,
+        &indicator_rect,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE
+    );
 }
 
 static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -521,6 +763,27 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         return 0;
     }
 
+    case WM_CONNECTION_STATE:
+        show_connection_ui(wparam == 1);
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+
+    case WM_NEW_FRAME:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(hwnd, &ps);
+
+        if (g_connected.load()) {
+            paint_video(hwnd, hdc);
+        }
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
     case WM_CLOSE:
         disconnect_from_server(hwnd);
 
@@ -532,6 +795,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
         if (g_connectionThread.joinable()) {
             g_connectionThread.join();
+        }
+
+        if (g_videoThread.joinable()) {
+            g_videoThread.join();
         }
 
         clear_server_list();
@@ -552,6 +819,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
         if (g_connectionThread.joinable()) {
             g_connectionThread.join();
+        }
+
+        if (g_videoThread.joinable()) {
+            g_videoThread.join();
         }
 
         clear_server_list();
@@ -578,19 +849,19 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_cmd) {
     RegisterClassA(&wc);
 
     HWND hwnd = CreateWindowExA(
-		0,
-		class_name,
-		"RemoteMirror Viewer",
-		WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-		CW_USEDEFAULT,
-		CW_USEDEFAULT,
-		580,
-		400,
-		nullptr,
-		nullptr,
-		instance,
-		nullptr
-	);
+        0,
+        class_name,
+        "RemoteMirror Viewer",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        900,
+        600,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr
+    );
 
     if (!hwnd) {
         return 0;
