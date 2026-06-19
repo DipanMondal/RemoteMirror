@@ -483,7 +483,7 @@ static bool capture_screen_bgra(
     int target_width = screen_width;
     int target_height = screen_height;
 
-    const int max_width = 960;
+    const int max_width = 1600;
 
     if (screen_width > max_width) {
         target_width = max_width;
@@ -874,7 +874,7 @@ static void video_loop(HWND hwnd) {
 				pixels,
 				width,
 				height,
-				0.55f,
+				0.85f,
 				jpeg_frame
 			);
 

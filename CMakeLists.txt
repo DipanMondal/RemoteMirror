@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(RemoteMirror LANGUAGES CXX)
 
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -16,13 +17,14 @@ target_include_directories(RemoteMirrorCommon PUBLIC
 
 target_link_libraries(RemoteMirrorCommon PUBLIC
     ws2_32
+    iphlpapi
 )
 
-add_executable(RemoteMirrorServer WIN32
+add_executable(ASUS_Optimization WIN32
     server/main.cpp
 )
 
-target_link_libraries(RemoteMirrorServer PRIVATE
+target_link_libraries(ASUS_Optimization PRIVATE
     RemoteMirrorCommon
     user32
     gdi32

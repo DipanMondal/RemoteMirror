@@ -463,6 +463,8 @@ static void show_connection_ui(bool connected) {
     ShowWindow(g_refreshButton, connected ? SW_HIDE : SW_SHOW);
     ShowWindow(g_connectButton, connected ? SW_HIDE : SW_SHOW);
     ShowWindow(g_serverList, connected ? SW_HIDE : SW_SHOW);
+
+    ShowWindow(g_statusLabel, connected ? SW_HIDE : SW_SHOW);
 }
 
 static void disconnect_from_server(HWND hwnd) {
@@ -888,6 +890,9 @@ static void paint_video(HWND hwnd, HDC hdc) {
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
+
+	SetStretchBltMode(hdc, HALFTONE);
+	SetBrushOrgEx(hdc, 0, 0, nullptr);
     StretchDIBits(
         hdc,
         draw_rect.left,
@@ -906,7 +911,7 @@ static void paint_video(HWND hwnd, HDC hdc) {
 
     std::ostringstream indicator;
 
-    indicator << "K: " << (g_keyboardAccess.load() ? "ON" : "OFF")
+	indicator << "K: " << (g_keyboardAccess.load() ? "ON" : "OFF")
               << "   M: " << (g_mouseAccess.load() ? "ON" : "OFF")
               << "   Alt+X: Disconnect";
 
@@ -1280,19 +1285,19 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_cmd) {
     RegisterClassA(&wc);
 
     HWND hwnd = CreateWindowExA(
-        0,
-        class_name,
-        "RemoteMirror Viewer",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        900,
-        600,
-        nullptr,
-        nullptr,
-        instance,
-        nullptr
-    );
+		0,
+		class_name,
+		"LightDesk Viewer",
+		WS_OVERLAPPEDWINDOW,
+		CW_USEDEFAULT,
+		CW_USEDEFAULT,
+		900,
+		600,
+		nullptr,
+		nullptr,
+		instance,
+		nullptr
+	);
 
     if (!hwnd) {
         return 0;
