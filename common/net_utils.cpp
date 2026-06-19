@@ -290,4 +290,16 @@ bool set_broadcast_enabled(SOCKET socket_handle) {
     ) == 0;
 }
 
+bool set_tcp_nodelay(SOCKET socket_handle) {
+    BOOL enabled = TRUE;
+
+    return setsockopt(
+        socket_handle,
+        IPPROTO_TCP,
+        TCP_NODELAY,
+        reinterpret_cast<const char*>(&enabled),
+        sizeof(enabled)
+    ) == 0;
+}
+
 }

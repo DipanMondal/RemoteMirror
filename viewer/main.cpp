@@ -6,9 +6,10 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
-#include <wincodec.h>
+#include <mfapi.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -18,6 +19,7 @@
 
 #include "protocol.h"
 #include "net_utils.h"
+#include "decoder.h"
 
 #define IDC_REFRESH_BUTTON 2001
 #define IDC_SERVER_LIST    2002
@@ -33,6 +35,7 @@
 #define WM_VIEWER_STATUS    (WM_APP + 12)
 #define WM_CONNECTION_STATE (WM_APP + 13)
 #define WM_NEW_FRAME        (WM_APP + 14)
+#define WM_ACCESS_CHANGED   (WM_APP + 15)
 
 static HWND g_serverList = nullptr;
 static HWND g_statusLabel = nullptr;
@@ -44,6 +47,12 @@ static std::atomic_bool g_connected{ false };
 static std::atomic_bool g_connecting{ false };
 static std::atomic_bool g_keyboardAccess{ false };
 static std::atomic_bool g_mouseAccess{ false };
+
+// Video pipeline diagnostics (shown on the black canvas before the first frame).
+static std::atomic_bool g_decoderFailed{ false };
+static std::atomic_int  g_framesReceived{ 0 };
+static std::atomic_int  g_framesDecoded{ 0 };
+static std::atomic_int  g_decodeFails{ 0 };
 
 static std::thread g_discoveryThread;
 static std::thread g_connectionThread;
@@ -103,147 +112,6 @@ static bool recv_all(SOCKET sock, char* data, int total_bytes) {
     return true;
 }
 
-template <typename T>
-static void safe_release(T*& ptr) {
-    if (ptr) {
-        ptr->Release();
-        ptr = nullptr;
-    }
-}
-
-static bool decode_jpeg_to_bgra(
-    const std::vector<unsigned char>& jpeg_data,
-    std::vector<unsigned char>& bgra_output,
-    int& out_width,
-    int& out_height
-) {
-    if (jpeg_data.empty()) {
-        return false;
-    }
-
-    HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    bool should_uninitialize_com = SUCCEEDED(co_hr);
-
-    if (FAILED(co_hr) && co_hr != RPC_E_CHANGED_MODE) {
-        return false;
-    }
-
-    bool success = false;
-
-    IWICImagingFactory* factory = nullptr;
-    IWICStream* stream = nullptr;
-    IWICBitmapDecoder* decoder = nullptr;
-    IWICBitmapFrameDecode* frame = nullptr;
-    IWICFormatConverter* converter = nullptr;
-
-    do {
-        HRESULT hr = CoCreateInstance(
-            CLSID_WICImagingFactory,
-            nullptr,
-            CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&factory)
-        );
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = factory->CreateStream(&stream);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = stream->InitializeFromMemory(
-            const_cast<BYTE*>(jpeg_data.data()),
-            static_cast<DWORD>(jpeg_data.size())
-        );
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = factory->CreateDecoderFromStream(
-            stream,
-            nullptr,
-            WICDecodeMetadataCacheOnLoad,
-            &decoder
-        );
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = decoder->GetFrame(0, &frame);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        UINT width = 0;
-        UINT height = 0;
-
-        hr = frame->GetSize(&width, &height);
-
-        if (FAILED(hr) || width == 0 || height == 0) {
-            break;
-        }
-
-        hr = factory->CreateFormatConverter(&converter);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = converter->Initialize(
-            frame,
-            GUID_WICPixelFormat32bppBGRA,
-            WICBitmapDitherTypeNone,
-            nullptr,
-            0.0,
-            WICBitmapPaletteTypeCustom
-        );
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        bgra_output.resize(static_cast<size_t>(width) * height * 4);
-
-        UINT stride = width * 4;
-        UINT image_size = static_cast<UINT>(bgra_output.size());
-
-        hr = converter->CopyPixels(
-            nullptr,
-            stride,
-            image_size,
-            bgra_output.data()
-        );
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        out_width = static_cast<int>(width);
-        out_height = static_cast<int>(height);
-
-        success = true;
-
-    } while (false);
-
-    safe_release(converter);
-    safe_release(frame);
-    safe_release(decoder);
-    safe_release(stream);
-    safe_release(factory);
-
-    if (should_uninitialize_com) {
-        CoUninitialize();
-    }
-
-    return success;
-}
-
 static void send_control_line(const std::string& line) {
     std::lock_guard<std::mutex> lock(g_socketMutex);
 
@@ -261,6 +129,8 @@ static void send_control_line(const std::string& line) {
     );
 }
 
+// Pushes the viewer's requested access state up to the host. Access can be
+// toggled from either end; whichever side changes it broadcasts to the other.
 static void send_access_state() {
     std::ostringstream out;
 
@@ -501,6 +371,8 @@ static void video_receive_loop(HWND hwnd, std::string ip) {
         g_videoSocket = sock;
     }
 
+    rm::set_tcp_nodelay(sock);
+
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(rm::VIDEO_PORT);
@@ -517,7 +389,36 @@ static void video_receive_loop(HWND hwnd, std::string ip) {
         return;
     }
 
-    post_status(hwnd, "Status: Connected - receiving screen feed | Alt+K Keyboard | Alt+M Mouse | Alt+X Disconnect");
+    // Reset per-session diagnostics.
+    g_decoderFailed.store(false);
+    g_framesReceived.store(0);
+    g_framesDecoded.store(0);
+    g_decodeFails.store(0);
+
+    // COM + Media Foundation for the H.264 decode pipeline on this thread.
+    bool com_ready = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    bool mf_ready = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+
+    rm::H264Decoder decoder;
+
+    if (!mf_ready || !decoder.initialize()) {
+        g_decoderFailed.store(true);
+        PostMessageA(hwnd, WM_NEW_FRAME, 0, 0); // refresh the diagnostic canvas
+        post_status(hwnd, "Status: H.264 decoder init failed");
+        if (mf_ready) {
+            MFShutdown();
+        }
+        if (com_ready) {
+            CoUninitialize();
+        }
+        close_video_socket_safe();
+        return;
+    }
+
+    post_status(hwnd, "Status: Connected - receiving screen feed | Alt+K Keyboard | Alt+M Mouse | Alt+X Disconnect (host can also grant/revoke)");
+
+    const uint32_t max_payload = 32u * 1024u * 1024u; // sanity cap against corrupt headers
+    std::vector<rm::DecodedFrame> frames;
 
     while (g_connected.load()) {
         rm::FrameHeader header{};
@@ -533,12 +434,13 @@ static void video_receive_loop(HWND hwnd, std::string ip) {
         }
 
         if (header.magic != rm::FRAME_MAGIC ||
-			header.format != rm::FRAME_FORMAT_JPEG ||
-			header.width == 0 ||
-			header.height == 0 ||
-			header.payload_size == 0) {
-			break;
-		}
+            header.format != rm::FRAME_FORMAT_H264 ||
+            header.width == 0 ||
+            header.height == 0 ||
+            header.payload_size == 0 ||
+            header.payload_size > max_payload) {
+            break;
+        }
 
         std::vector<unsigned char> payload(header.payload_size);
 
@@ -552,31 +454,45 @@ static void video_receive_loop(HWND hwnd, std::string ip) {
             break;
         }
 
-        std::vector<unsigned char> decoded_bgra;
-		int decoded_width = 0;
-		int decoded_height = 0;
+        g_framesReceived.fetch_add(1);
 
-		bool decode_ok = decode_jpeg_to_bgra(
-			payload,
-			decoded_bgra,
-			decoded_width,
-			decoded_height
-		);
+        frames.clear();
 
-		if (!decode_ok || decoded_bgra.empty()) {
-			continue;
-		}
+        if (!decoder.decode(payload.data(), payload.size(), frames)) {
+            g_decodeFails.fetch_add(1);
+            PostMessageA(hwnd, WM_NEW_FRAME, 0, 0); // refresh diagnostics
+            continue;
+        }
 
-		{
-			std::lock_guard<std::mutex> lock(g_frameMutex);
-			g_latestFrame = std::move(decoded_bgra);
-			g_frameWidth = decoded_width;
-			g_frameHeight = decoded_height;
-			g_remoteScreenWidth = static_cast<int>(header.screen_width);
-			g_remoteScreenHeight = static_cast<int>(header.screen_height);
-		}
+        if (frames.empty()) {
+            // Data arrived and decoded without error but produced no frame yet
+            // (decoder warming up); keep the on-screen counters fresh.
+            PostMessageA(hwnd, WM_NEW_FRAME, 0, 0);
+        }
 
-		PostMessageA(hwnd, WM_NEW_FRAME, 0, 0);
+        for (rm::DecodedFrame& frame : frames) {
+            g_framesDecoded.fetch_add(1);
+            {
+                std::lock_guard<std::mutex> lock(g_frameMutex);
+                g_latestFrame = std::move(frame.bgra);
+                g_frameWidth = frame.width;
+                g_frameHeight = frame.height;
+                g_remoteScreenWidth = static_cast<int>(header.screen_width);
+                g_remoteScreenHeight = static_cast<int>(header.screen_height);
+            }
+
+            PostMessageA(hwnd, WM_NEW_FRAME, 0, 0);
+        }
+    }
+
+    decoder.shutdown();
+
+    if (mf_ready) {
+        MFShutdown();
+    }
+
+    if (com_ready) {
+        CoUninitialize();
     }
 
     close_video_socket_safe();
@@ -602,6 +518,9 @@ static void connection_loop(HWND hwnd, std::string ip) {
         std::lock_guard<std::mutex> lock(g_socketMutex);
         g_controlSocket = sock;
     }
+
+    // Flush input events immediately for responsive remote control.
+    rm::set_tcp_nodelay(sock);
 
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
@@ -665,19 +584,41 @@ static void connection_loop(HWND hwnd, std::string ip) {
 
     PostMessageA(hwnd, WM_CONNECTION_STATE, 1, 0);
 
-    send_access_state();
-
     if (g_videoThread.joinable()) {
         g_videoThread.join();
     }
 
     g_videoThread = std::thread(video_receive_loop, hwnd, ip);
 
+    // The host drives access: parse grant/revoke lines pushed over the control
+    // channel and mirror them into the local input-gating state.
+    std::string pending;
+
     while (g_connected.load()) {
         int server_msg = recv(sock, buffer, sizeof(buffer) - 1, 0);
 
         if (server_msg <= 0) {
             break;
+        }
+
+        buffer[server_msg] = '\0';
+        pending += buffer;
+
+        size_t newline_pos = std::string::npos;
+
+        while ((newline_pos = pending.find('\n')) != std::string::npos) {
+            std::string line = pending.substr(0, newline_pos);
+            pending.erase(0, newline_pos + 1);
+
+            if (line.rfind(rm::CONTROL_ACCESS_STATE, 0) == 0) {
+                int keyboard = std::atoi(extract_value(line, "keyboard").c_str());
+                int mouse = std::atoi(extract_value(line, "mouse").c_str());
+
+                g_keyboardAccess.store(keyboard == 1);
+                g_mouseAccess.store(mouse == 1);
+
+                PostMessageA(hwnd, WM_ACCESS_CHANGED, 0, 0);
+            }
         }
     }
 
@@ -866,13 +807,38 @@ static void paint_video(HWND hwnd, HDC hdc) {
     SetBkMode(hdc, TRANSPARENT);
 
     if (frame_copy.empty() || width <= 0 || height <= 0) {
-        SetTextColor(hdc, RGB(255, 255, 255));
+        std::ostringstream diag;
+
+        if (g_decoderFailed.load()) {
+            diag << "H.264 decoder unavailable on this system.\n\n"
+                 << "The viewer needs the Media Foundation H.264 codec. This is missing on:\n"
+                 << "  - Wine / Linux (e.g. running the .exe in an Ubuntu VM)\n"
+                 << "  - Windows N editions without the Media Feature Pack\n\n"
+                 << "Run the viewer on real Windows (or a normal Windows VM).";
+        } else {
+            diag << "Waiting for video frames...\n\n"
+                 << "received=" << g_framesReceived.load()
+                 << "   decoded=" << g_framesDecoded.load()
+                 << "   decode_failed=" << g_decodeFails.load() << "\n";
+
+            if (g_framesReceived.load() == 0) {
+                diag << "\n(No data on the video channel yet - check port 50511 / firewall.)";
+            } else if (g_framesDecoded.load() == 0) {
+                diag << "\n(Data is arriving but not decoding - likely missing H.264 codec.)";
+            }
+        }
+
+        SetTextColor(hdc, RGB(235, 235, 235));
+        RECT text_rect = video_bounds;
+        text_rect.left += 20;
+        text_rect.right -= 20;
+
         DrawTextA(
             hdc,
-            "Waiting for video frames...",
+            diag.str().c_str(),
             -1,
-            &video_bounds,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE
+            &text_rect,
+            DT_CENTER | DT_WORDBREAK
         );
 
         g_lastVideoRect = video_bounds;
@@ -1197,6 +1163,14 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         return 0;
 
     case WM_NEW_FRAME:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_ACCESS_CHANGED:
+        // Host changed our granted access; stop driving the mouse if revoked.
+        if (!g_mouseAccess.load()) {
+            ReleaseCapture();
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
 
