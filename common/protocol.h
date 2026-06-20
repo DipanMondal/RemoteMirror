@@ -28,16 +28,21 @@ constexpr uint32_t FRAME_MAGIC = 0x524D4652;
 
 constexpr uint32_t FRAME_FORMAT_BGRA = 1;
 constexpr uint32_t FRAME_FORMAT_JPEG = 2;
+constexpr uint32_t FRAME_FORMAT_H264 = 3;
+
+// Bit flags for FrameHeader::flags
+constexpr uint32_t FRAME_FLAG_KEYFRAME = 0x1; // payload is/contains an IDR access unit
 
 #pragma pack(push, 1)
 struct FrameHeader {
     uint32_t magic;
-    uint32_t width;
-    uint32_t height;
-    uint32_t screen_width;
-    uint32_t screen_height;
-    uint32_t format;
-    uint32_t payload_size;
+    uint32_t width;         // encoded (coded) frame width
+    uint32_t height;        // encoded (coded) frame height
+    uint32_t screen_width;  // true remote desktop width (for input mapping)
+    uint32_t screen_height; // true remote desktop height (for input mapping)
+    uint32_t format;        // FRAME_FORMAT_*
+    uint32_t flags;         // FRAME_FLAG_*
+    uint32_t payload_size;  // bytes of payload following this header
     uint64_t frame_id;
 };
 #pragma pack(pop)

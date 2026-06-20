@@ -19,4 +19,8 @@ std::string get_primary_ipv4();
 bool set_socket_timeout_ms(SOCKET socket_handle, int timeout_ms);
 bool set_broadcast_enabled(SOCKET socket_handle);
 
+// Disables Nagle's algorithm so small control packets and the video
+// header+payload are flushed immediately instead of being coalesced.
+bool set_tcp_nodelay(SOCKET socket_handle);
+
 }

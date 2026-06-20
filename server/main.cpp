@@ -5,7 +5,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <wincodec.h>
+#include <mfapi.h>
 
 #include <atomic>
 #include <chrono>
@@ -18,26 +18,33 @@
 
 #include "protocol.h"
 #include "net_utils.h"
+#include "capture.h"
+#include "encoder.h"
 
-#define IDC_POWER_BUTTON 1001
-#define IDC_STATUS_LABEL 1002
-#define IDC_INFO_LABEL   1003
-#define IDC_CLIENT_LABEL 1004
-#define IDC_ACCESS_LABEL 1005
+#define IDC_POWER_BUTTON    1001
+#define IDC_STATUS_LABEL    1002
+#define IDC_INFO_LABEL      1003
+#define IDC_CLIENT_LABEL    1004
+#define IDC_ACCESS_LABEL    1005
+#define IDC_KEYBOARD_BUTTON 1006
+#define IDC_MOUSE_BUTTON    1007
 
 #define WM_SERVER_STATUS (WM_APP + 1)
 #define WM_CLIENT_STATUS (WM_APP + 2)
-#define WM_ACCESS_STATUS (WM_APP + 3)
+#define WM_UPDATE_ACCESS (WM_APP + 3)
 
 static HWND g_statusLabel = nullptr;
 static HWND g_infoLabel = nullptr;
 static HWND g_clientLabel = nullptr;
 static HWND g_accessLabel = nullptr;
 static HWND g_powerButton = nullptr;
+static HWND g_keyboardButton = nullptr;
+static HWND g_mouseButton = nullptr;
 
 static std::atomic_bool g_serverRunning{ false };
 static std::atomic_bool g_keyboardAccess{ false };
 static std::atomic_bool g_mouseAccess{ false };
+static std::atomic_bool g_viewerConnected{ false };
 
 static std::thread g_discoveryThread;
 static std::thread g_controlThread;
@@ -70,13 +77,56 @@ static void post_client_status(HWND hwnd, const std::string& text) {
     PostMessageA(hwnd, WM_CLIENT_STATUS, 0, reinterpret_cast<LPARAM>(copy));
 }
 
-static void post_access_status(HWND hwnd) {
-    std::ostringstream out;
-    out << "Keyboard Access: " << (g_keyboardAccess.load() ? "ON" : "OFF")
-        << "    Mouse Access: " << (g_mouseAccess.load() ? "ON" : "OFF");
+// Asks the UI thread to refresh the access buttons/label from the current state.
+static void post_access_ui(HWND hwnd) {
+    PostMessageA(hwnd, WM_UPDATE_ACCESS, 0, 0);
+}
 
-    std::string* copy = new std::string(out.str());
-    PostMessageA(hwnd, WM_ACCESS_STATUS, 0, reinterpret_cast<LPARAM>(copy));
+// Pushes the host's current grant state down to the connected viewer so its UI
+// and input gating match what the host has allowed.
+static void send_access_state_to_viewer() {
+    std::ostringstream out;
+    out << rm::CONTROL_ACCESS_STATE
+        << "|keyboard=" << (g_keyboardAccess.load() ? 1 : 0)
+        << "|mouse=" << (g_mouseAccess.load() ? 1 : 0)
+        << "\n";
+
+    std::string line = out.str();
+
+    std::lock_guard<std::mutex> lock(g_socketMutex);
+
+    if (g_controlClientSocket != INVALID_SOCKET) {
+        send(g_controlClientSocket, line.c_str(), static_cast<int>(line.size()), 0);
+    }
+}
+
+// Runs on the UI thread: button captions reflect grant state, and the buttons
+// are only enabled while a viewer is connected.
+static void refresh_access_controls() {
+    bool connected = g_viewerConnected.load();
+    bool keyboard = g_keyboardAccess.load();
+    bool mouse = g_mouseAccess.load();
+
+    if (g_keyboardButton) {
+        SetWindowTextA(g_keyboardButton,
+            keyboard ? "Keyboard: GRANTED  (click to revoke)"
+                     : "Keyboard: blocked  (click to grant)");
+        EnableWindow(g_keyboardButton, connected ? TRUE : FALSE);
+    }
+
+    if (g_mouseButton) {
+        SetWindowTextA(g_mouseButton,
+            mouse ? "Mouse: GRANTED  (click to revoke)"
+                  : "Mouse: blocked  (click to grant)");
+        EnableWindow(g_mouseButton, connected ? TRUE : FALSE);
+    }
+
+    if (g_accessLabel) {
+        std::ostringstream out;
+        out << "Keyboard Access: " << (keyboard ? "ON" : "OFF")
+            << "    Mouse Access: " << (mouse ? "ON" : "OFF");
+        SetWindowTextA(g_accessLabel, out.str().c_str());
+    }
 }
 
 static bool send_all(SOCKET sock, const char* data, int total_bytes) {
@@ -93,188 +143,6 @@ static bool send_all(SOCKET sock, const char* data, int total_bytes) {
     }
 
     return true;
-}
-
-template <typename T>
-static void safe_release(T*& ptr) {
-    if (ptr) {
-        ptr->Release();
-        ptr = nullptr;
-    }
-}
-
-static bool encode_bgra_to_jpeg(
-    const std::vector<unsigned char>& bgra_pixels,
-    int width,
-    int height,
-    float quality,
-    std::vector<unsigned char>& jpeg_output
-) {
-    if (bgra_pixels.empty() || width <= 0 || height <= 0) {
-        return false;
-    }
-
-    HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    bool should_uninitialize_com = SUCCEEDED(co_hr);
-
-    if (FAILED(co_hr) && co_hr != RPC_E_CHANGED_MODE) {
-        return false;
-    }
-
-    bool success = false;
-
-    IWICImagingFactory* factory = nullptr;
-    IStream* stream = nullptr;
-    IWICBitmapEncoder* encoder = nullptr;
-    IWICBitmapFrameEncode* frame = nullptr;
-    IPropertyBag2* property_bag = nullptr;
-
-    do {
-        HRESULT hr = CoCreateInstance(
-            CLSID_WICImagingFactory,
-            nullptr,
-            CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&factory)
-        );
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = CreateStreamOnHGlobal(nullptr, TRUE, &stream);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = encoder->CreateNewFrame(&frame, &property_bag);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        if (property_bag) {
-            PROPBAG2 option{};
-            option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
-
-            VARIANT value{};
-            VariantInit(&value);
-            value.vt = VT_R4;
-            value.fltVal = quality;
-
-            property_bag->Write(1, &option, &value);
-            VariantClear(&value);
-        }
-
-        hr = frame->Initialize(property_bag);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = frame->SetSize(width, height);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        WICPixelFormatGUID pixel_format = GUID_WICPixelFormat24bppBGR;
-
-        hr = frame->SetPixelFormat(&pixel_format);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        std::vector<unsigned char> bgr_pixels;
-        bgr_pixels.resize(static_cast<size_t>(width) * height * 3);
-
-        for (int i = 0; i < width * height; ++i) {
-            bgr_pixels[i * 3 + 0] = bgra_pixels[i * 4 + 0];
-            bgr_pixels[i * 3 + 1] = bgra_pixels[i * 4 + 1];
-            bgr_pixels[i * 3 + 2] = bgra_pixels[i * 4 + 2];
-        }
-
-        UINT stride = static_cast<UINT>(width * 3);
-        UINT image_size = static_cast<UINT>(bgr_pixels.size());
-
-        hr = frame->WritePixels(
-            static_cast<UINT>(height),
-            stride,
-            image_size,
-            bgr_pixels.data()
-        );
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = frame->Commit();
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        hr = encoder->Commit();
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        STATSTG stat{};
-        hr = stream->Stat(&stat, STATFLAG_NONAME);
-
-        if (FAILED(hr)) {
-            break;
-        }
-
-        HGLOBAL global_memory = nullptr;
-        hr = GetHGlobalFromStream(stream, &global_memory);
-
-        if (FAILED(hr) || !global_memory) {
-            break;
-        }
-
-        SIZE_T jpeg_size = static_cast<SIZE_T>(stat.cbSize.QuadPart);
-
-        void* memory_ptr = GlobalLock(global_memory);
-
-        if (!memory_ptr) {
-            break;
-        }
-
-        jpeg_output.resize(jpeg_size);
-        std::memcpy(jpeg_output.data(), memory_ptr, jpeg_size);
-
-        GlobalUnlock(global_memory);
-
-        success = true;
-
-    } while (false);
-
-    safe_release(property_bag);
-    safe_release(frame);
-    safe_release(encoder);
-    safe_release(stream);
-    safe_release(factory);
-
-    if (should_uninitialize_com) {
-        CoUninitialize();
-    }
-
-    return success;
 }
 
 static std::string extract_value(const std::string& text, const std::string& key) {
@@ -400,6 +268,9 @@ static void inject_mouse_wheel(int delta) {
 }
 
 static void process_control_line(HWND hwnd, const std::string& line) {
+    // Access can be toggled from either end. When the viewer changes it, mirror
+    // the new state into the host's gating + UI. We do not echo it back (the
+    // viewer is already in that state), which avoids a feedback loop.
     if (starts_with(line, rm::CONTROL_ACCESS_STATE)) {
         int keyboard = to_int_safe(extract_value(line, "keyboard"));
         int mouse = to_int_safe(extract_value(line, "mouse"));
@@ -407,7 +278,7 @@ static void process_control_line(HWND hwnd, const std::string& line) {
         g_keyboardAccess.store(keyboard == 1);
         g_mouseAccess.store(mouse == 1);
 
-        post_access_status(hwnd);
+        post_access_ui(hwnd);
         return;
     }
 
@@ -461,113 +332,6 @@ static void process_control_line(HWND hwnd, const std::string& line) {
         inject_mouse_wheel(delta);
         return;
     }
-}
-
-static bool capture_screen_bgra(
-    std::vector<unsigned char>& pixels,
-    int& out_width,
-    int& out_height,
-    int& out_screen_width,
-    int& out_screen_height
-) {
-    int screen_width = GetSystemMetrics(SM_CXSCREEN);
-    int screen_height = GetSystemMetrics(SM_CYSCREEN);
-
-    if (screen_width <= 0 || screen_height <= 0) {
-        return false;
-    }
-
-    out_screen_width = screen_width;
-    out_screen_height = screen_height;
-
-    int target_width = screen_width;
-    int target_height = screen_height;
-
-    const int max_width = 1600;
-
-    if (screen_width > max_width) {
-        target_width = max_width;
-        target_height = static_cast<int>((static_cast<double>(screen_height) / screen_width) * target_width);
-    }
-
-    HDC screen_dc = GetDC(nullptr);
-
-    if (!screen_dc) {
-        return false;
-    }
-
-    HDC memory_dc = CreateCompatibleDC(screen_dc);
-
-    if (!memory_dc) {
-        ReleaseDC(nullptr, screen_dc);
-        return false;
-    }
-
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = target_width;
-    bmi.bmiHeader.biHeight = -target_height;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* raw_bits = nullptr;
-
-    HBITMAP bitmap = CreateDIBSection(
-        memory_dc,
-        &bmi,
-        DIB_RGB_COLORS,
-        &raw_bits,
-        nullptr,
-        0
-    );
-
-    if (!bitmap || !raw_bits) {
-        DeleteDC(memory_dc);
-        ReleaseDC(nullptr, screen_dc);
-        return false;
-    }
-
-    HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
-
-    SetStretchBltMode(memory_dc, HALFTONE);
-
-    BOOL ok = StretchBlt(
-        memory_dc,
-        0,
-        0,
-        target_width,
-        target_height,
-        screen_dc,
-        0,
-        0,
-        screen_width,
-        screen_height,
-        SRCCOPY
-    );
-
-    if (!ok) {
-        SelectObject(memory_dc, old_bitmap);
-        DeleteObject(bitmap);
-        DeleteDC(memory_dc);
-        ReleaseDC(nullptr, screen_dc);
-        return false;
-    }
-
-    size_t data_size = static_cast<size_t>(target_width) * target_height * 4;
-
-    pixels.resize(data_size);
-    std::memcpy(pixels.data(), raw_bits, data_size);
-
-    out_width = target_width;
-    out_height = target_height;
-
-    SelectObject(memory_dc, old_bitmap);
-    DeleteObject(bitmap);
-    DeleteDC(memory_dc);
-    ReleaseDC(nullptr, screen_dc);
-
-    return true;
 }
 
 static void discovery_loop(HWND hwnd) {
@@ -648,15 +412,23 @@ static void handle_connected_client(HWND hwnd, SOCKET client_socket, const std::
         g_controlClientSocket = client_socket;
     }
 
+    // Flush input events immediately for responsive remote control.
+    rm::set_tcp_nodelay(client_socket);
+
+    // New session always starts with nothing granted; the host decides.
     g_keyboardAccess.store(false);
     g_mouseAccess.store(false);
+    g_viewerConnected.store(true);
 
     post_status(hwnd, "Status: ON - Viewer connected");
     post_client_status(hwnd, "Connected Viewer: " + client_ip);
-    post_access_status(hwnd);
+    post_access_ui(hwnd);
 
     std::string ok = std::string(rm::CONTROL_OK) + "\n";
     send(client_socket, ok.c_str(), static_cast<int>(ok.size()), 0);
+
+    // Tell the viewer the initial (blocked) grant state.
+    send_access_state_to_viewer();
 
     char buffer[2048]{};
     std::string pending;
@@ -682,11 +454,12 @@ static void handle_connected_client(HWND hwnd, SOCKET client_socket, const std::
 
                 g_keyboardAccess.store(false);
                 g_mouseAccess.store(false);
+                g_viewerConnected.store(false);
 
                 if (g_serverRunning.load()) {
                     post_status(hwnd, "Status: ON - Waiting for viewers...");
                     post_client_status(hwnd, "Connected Viewer: None");
-                    post_access_status(hwnd);
+                    post_access_ui(hwnd);
                 }
 
                 return;
@@ -700,11 +473,12 @@ static void handle_connected_client(HWND hwnd, SOCKET client_socket, const std::
 
     g_keyboardAccess.store(false);
     g_mouseAccess.store(false);
+    g_viewerConnected.store(false);
 
     if (g_serverRunning.load()) {
         post_status(hwnd, "Status: ON - Waiting for viewers...");
         post_client_status(hwnd, "Connected Viewer: None");
-        post_access_status(hwnd);
+        post_access_ui(hwnd);
     }
 }
 
@@ -792,6 +566,133 @@ static void control_loop(HWND hwnd) {
     close_socket_safe(g_controlListenSocket);
 }
 
+// Captures the screen with DXGI Desktop Duplication and streams H.264 access
+// units to a single connected viewer until it disconnects or the server stops.
+static void stream_to_client(HWND hwnd, SOCKET client_socket, bool mf_ready) {
+    if (!mf_ready) {
+        post_status(hwnd, "Status: Media Foundation init failed");
+        return;
+    }
+
+    rm::ScreenDuplicator capturer;
+
+    if (!capturer.initialize()) {
+        post_status(hwnd, "Status: Screen capture init failed (no DXGI and no GDI)");
+        return;
+    }
+
+    if (capturer.using_gdi()) {
+        std::ostringstream mode;
+        mode << "Status: ON - streaming (GDI fallback; DXGI 0x"
+             << std::hex << std::uppercase
+             << static_cast<unsigned long>(capturer.last_error()) << ")";
+        post_status(hwnd, mode.str());
+    } else {
+        post_status(hwnd, "Status: ON - streaming (DXGI)");
+    }
+
+    rm::H264Encoder encoder;
+
+    const int target_fps = 30;
+    int enc_w = 0;
+    int enc_h = 0;
+
+    uint64_t frame_id = 0;
+    auto last_keyframe = std::chrono::steady_clock::now();
+    bool first_frame = true;
+
+    std::vector<unsigned char> bgra;
+    std::vector<std::vector<unsigned char>> units;
+    std::vector<bool> keyflags;
+    std::vector<char> send_scratch;
+
+    while (g_serverRunning.load()) {
+        int width = 0;
+        int height = 0;
+
+        rm::ScreenDuplicator::Result result = capturer.acquire(bgra, width, height, 30);
+
+        if (result == rm::ScreenDuplicator::Result::Idle) {
+            continue;
+        }
+
+        if (result == rm::ScreenDuplicator::Result::Lost) {
+            capturer.shutdown();
+            if (!capturer.initialize()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            enc_w = 0; // force encoder rebuild on next captured frame
+            continue;
+        }
+
+        if (result == rm::ScreenDuplicator::Result::Error) {
+            break;
+        }
+
+        // (Re)create the encoder when the capture resolution changes.
+        if (width != enc_w || height != enc_h) {
+            long long bitrate = static_cast<long long>(width) * height * target_fps * 7 / 100; // ~0.07 bpp
+            bitrate = clamp_int(static_cast<int>(bitrate < 20000000 ? bitrate : 20000000), 1500000, 20000000);
+
+            if (!encoder.initialize(width, height, target_fps, static_cast<int>(bitrate))) {
+                post_status(hwnd, "Status: H.264 encoder init failed");
+                break;
+            }
+
+            enc_w = width;
+            enc_h = height;
+            first_frame = true;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        bool force_key = first_frame ||
+            std::chrono::duration_cast<std::chrono::seconds>(now - last_keyframe).count() >= 3;
+
+        units.clear();
+        keyflags.clear();
+
+        if (!encoder.encode(bgra.data(), force_key, units, keyflags)) {
+            continue; // transient; keep going
+        }
+
+        if (force_key && !units.empty()) {
+            last_keyframe = now;
+            first_frame = false;
+        }
+
+        bool send_failed = false;
+
+        for (size_t i = 0; i < units.size(); ++i) {
+            const std::vector<unsigned char>& unit = units[i];
+
+            rm::FrameHeader header{};
+            header.magic = rm::FRAME_MAGIC;
+            header.width = static_cast<uint32_t>(enc_w);
+            header.height = static_cast<uint32_t>(enc_h);
+            header.screen_width = static_cast<uint32_t>(capturer.desktop_width());
+            header.screen_height = static_cast<uint32_t>(capturer.desktop_height());
+            header.format = rm::FRAME_FORMAT_H264;
+            header.flags = keyflags[i] ? rm::FRAME_FLAG_KEYFRAME : 0u;
+            header.payload_size = static_cast<uint32_t>(unit.size());
+            header.frame_id = frame_id++;
+
+            // Coalesce header + payload into one send (pairs with TCP_NODELAY).
+            send_scratch.resize(sizeof(header) + unit.size());
+            std::memcpy(send_scratch.data(), &header, sizeof(header));
+            std::memcpy(send_scratch.data() + sizeof(header), unit.data(), unit.size());
+
+            if (!send_all(client_socket, send_scratch.data(), static_cast<int>(send_scratch.size()))) {
+                send_failed = true;
+                break;
+            }
+        }
+
+        if (send_failed) {
+            break;
+        }
+    }
+}
+
 static void video_loop(HWND hwnd) {
     {
         std::lock_guard<std::mutex> lock(g_socketMutex);
@@ -830,6 +731,10 @@ static void video_loop(HWND hwnd) {
         return;
     }
 
+    // COM + Media Foundation for the H.264 encode pipeline on this thread.
+    bool com_ready = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    bool mf_ready = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+
     while (g_serverRunning.load()) {
         sockaddr_in client_addr{};
         int client_len = sizeof(client_addr);
@@ -848,75 +753,24 @@ static void video_loop(HWND hwnd) {
             continue;
         }
 
+        rm::set_tcp_nodelay(client_socket);
+
         {
             std::lock_guard<std::mutex> lock(g_socketMutex);
             g_videoClientSocket = client_socket;
         }
 
-        uint64_t frame_id = 0;
-
-        while (g_serverRunning.load()) {
-            std::vector<unsigned char> pixels;
-
-            int width = 0;
-            int height = 0;
-            int screen_width = 0;
-            int screen_height = 0;
-
-            if (!capture_screen_bgra(pixels, width, height, screen_width, screen_height)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
-
-            std::vector<unsigned char> jpeg_frame;
-
-			bool jpeg_ok = encode_bgra_to_jpeg(
-				pixels,
-				width,
-				height,
-				0.85f,
-				jpeg_frame
-			);
-
-			if (!jpeg_ok || jpeg_frame.empty()) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(100));
-				continue;
-			}
-
-			rm::FrameHeader header{};
-			header.magic = rm::FRAME_MAGIC;
-			header.width = static_cast<uint32_t>(width);
-			header.height = static_cast<uint32_t>(height);
-			header.screen_width = static_cast<uint32_t>(screen_width);
-			header.screen_height = static_cast<uint32_t>(screen_height);
-			header.format = rm::FRAME_FORMAT_JPEG;
-			header.payload_size = static_cast<uint32_t>(jpeg_frame.size());
-			header.frame_id = frame_id++;
-
-			bool header_ok = send_all(
-				client_socket,
-				reinterpret_cast<const char*>(&header),
-				sizeof(header)
-			);
-
-			if (!header_ok) {
-				break;
-			}
-
-			bool payload_ok = send_all(
-				client_socket,
-				reinterpret_cast<const char*>(jpeg_frame.data()),
-				static_cast<int>(jpeg_frame.size())
-			);
-
-			if (!payload_ok) {
-				break;
-			}
-
-			std::this_thread::sleep_for(std::chrono::milliseconds(66));
-        }
+        stream_to_client(hwnd, client_socket, mf_ready);
 
         close_socket_safe(g_videoClientSocket);
+    }
+
+    if (mf_ready) {
+        MFShutdown();
+    }
+
+    if (com_ready) {
+        CoUninitialize();
     }
 
     close_socket_safe(g_videoListenSocket);
@@ -946,7 +800,11 @@ static void start_server(HWND hwnd) {
 
     SetWindowTextA(g_infoLabel, info.str().c_str());
     SetWindowTextA(g_clientLabel, "Connected Viewer: None");
-    SetWindowTextA(g_accessLabel, "Keyboard Access: OFF    Mouse Access: OFF");
+
+    g_viewerConnected.store(false);
+    g_keyboardAccess.store(false);
+    g_mouseAccess.store(false);
+    refresh_access_controls();
 
     g_discoveryThread = std::thread(discovery_loop, hwnd);
     g_controlThread = std::thread(control_loop, hwnd);
@@ -980,11 +838,12 @@ static void stop_server(HWND hwnd) {
 
     g_keyboardAccess.store(false);
     g_mouseAccess.store(false);
+    g_viewerConnected.store(false);
 
     SetWindowTextA(g_powerButton, "Turn ON Server");
     SetWindowTextA(g_statusLabel, "Status: OFF");
     SetWindowTextA(g_clientLabel, "Connected Viewer: None");
-    SetWindowTextA(g_accessLabel, "Keyboard Access: OFF    Mouse Access: OFF");
+    refresh_access_controls();
 
     rm::cleanup_winsock();
 }
@@ -1047,11 +906,33 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             nullptr
         );
 
+        g_keyboardButton = CreateWindowA(
+            "BUTTON",
+            "Keyboard: blocked  (click to grant)",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
+            30, 225, 330, 32,
+            hwnd,
+            reinterpret_cast<HMENU>(IDC_KEYBOARD_BUTTON),
+            nullptr,
+            nullptr
+        );
+
+        g_mouseButton = CreateWindowA(
+            "BUTTON",
+            "Mouse: blocked  (click to grant)",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
+            30, 262, 330, 32,
+            hwnd,
+            reinterpret_cast<HMENU>(IDC_MOUSE_BUTTON),
+            nullptr,
+            nullptr
+        );
+
         g_infoLabel = CreateWindowA(
             "STATIC",
             "PC Name: -\r\nIP: -\r\nDiscovery Port: 50500\r\nControl Port: 50510\r\nVideo Port: 50511",
             WS_CHILD | WS_VISIBLE,
-            30, 235, 330, 120,
+            30, 305, 330, 120,
             hwnd,
             reinterpret_cast<HMENU>(IDC_INFO_LABEL),
             nullptr,
@@ -1066,6 +947,18 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 stop_server(hwnd);
             } else {
                 start_server(hwnd);
+            }
+        } else if (LOWORD(wparam) == IDC_KEYBOARD_BUTTON) {
+            if (g_viewerConnected.load()) {
+                g_keyboardAccess.store(!g_keyboardAccess.load());
+                send_access_state_to_viewer();
+                refresh_access_controls();
+            }
+        } else if (LOWORD(wparam) == IDC_MOUSE_BUTTON) {
+            if (g_viewerConnected.load()) {
+                g_mouseAccess.store(!g_mouseAccess.load());
+                send_access_state_to_viewer();
+                refresh_access_controls();
             }
         }
 
@@ -1093,16 +986,9 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         return 0;
     }
 
-    case WM_ACCESS_STATUS: {
-        std::string* text = reinterpret_cast<std::string*>(lparam);
-
-        if (text) {
-            SetWindowTextA(g_accessLabel, text->c_str());
-            delete text;
-        }
-
+    case WM_UPDATE_ACCESS:
+        refresh_access_controls();
         return 0;
-    }
 
     case WM_CLOSE:
         stop_server(hwnd);
@@ -1138,7 +1024,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_cmd) {
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         400,
-        420,
+        500,
         nullptr,
         nullptr,
         instance,
