@@ -1,7 +1,7 @@
 #define MyAppName "ASUS_ Optimization"
 #define MyAppVersion "0.1.0"
 #define MyAppPublisher "LightDesk"
-#define MyBuildDir "..\..\build\Release"
+#define MyBuildDir "..\..\build"
 
 [Setup]
 AppId={{DA1D3942-6E1B-4CB5-AB15-07B14D68D1DF}
@@ -42,9 +42,9 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=
 [Code]
 const
   EnvironmentKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
-  HWND_BROADCAST = $FFFF;
-  WM_SETTINGCHANGE = $001A;
-  SMTO_ABORTIFHUNG = $0002;
+  LTDESK_HWND_BROADCAST = $FFFF;
+  LTDESK_WM_SETTINGCHANGE = $001A;
+  LTDESK_SMTO_ABORTIFHUNG = $0002;
 
 function SendMessageTimeout(hWnd: LongWord; Msg: LongWord; wParam: LongWord; lParam: String; fuFlags: LongWord; uTimeout: LongWord; var lpdwResult: LongWord): LongWord;
   external 'SendMessageTimeoutW@user32.dll stdcall';
@@ -53,7 +53,8 @@ procedure BroadcastEnvironmentChange();
 var
   ResultCode: LongWord;
 begin
-  SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', SMTO_ABORTIFHUNG, 5000, ResultCode);
+  SendMessageTimeout(LTDESK_HWND_BROADCAST, LTDESK_WM_SETTINGCHANGE, 0, 'Environment',
+  LTDESK_SMTO_ABORTIFHUNG, 5000, ResultCode);
 end;
 
 function PathContains(PathValue: String; DirValue: String): Boolean;
