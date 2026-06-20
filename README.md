@@ -11,8 +11,6 @@ watches the live screen, and — when granted — drives it.
 - **Control:** keyboard/mouse access can be granted/revoked from **either side**
 
 > Naming note: the server executable currently builds as `ASUS_Optimization.exe`.
-> For an internal, auditable tool you should rename this to something honest
-> (see `CMakeLists.txt`). It is called out here so nobody is surprised.
 
 ---
 
@@ -49,12 +47,6 @@ watches the live screen, and — when granted — drives it.
 +-------------------------+                     +-------------------------+
 ```
 
-| Channel    | Port  | Protocol | Purpose                                  |
-|------------|-------|----------|------------------------------------------|
-| Discovery  | 50500 | UDP      | Broadcast find-servers + reply           |
-| Control    | 50510 | TCP      | Handshake, access grants, input events   |
-| Video      | 50511 | TCP      | H.264 frame stream                        |
-
 ---
 
 ## Prerequisites
@@ -84,7 +76,7 @@ Outputs land in `build\Release\`:
 
 | Binary                   | Role                                            |
 |--------------------------|-------------------------------------------------|
-| `ASUS_Optimization.exe`  | **Server** (the controlled/host machine)        |
+| `ASUS_Optimization.exe`  | **Server** (the host machine)        |
 | `RemoteMirrorViewer.exe` | **Viewer** (the controller)                     |
 | `PipelineTest.exe`       | Offline encode→decode self-test (no network)    |
 
@@ -123,13 +115,6 @@ the two stay in sync:
 The on-screen `K: ON/OFF  M: ON/OFF` indicator (top-right of the viewer) reflects
 the current grant regardless of which side changed it. Input is injected on the
 host **only** while the matching grant is ON.
-
-### Quick single-PC smoke test
-
-You can run the server and viewer on the **same** machine: Turn ON the server,
-then in the viewer Refresh → Connect to the host's own LAN entry. You'll see your
-own screen mirrored. (Granting input control will drive your own machine, so do
-that only briefly.) Two machines is the realistic test.
 
 ---
 
@@ -172,91 +157,3 @@ that only briefly.) Two machines is the realistic test.
   ```
 
 ---
-
-## Testing with a mobile device on the same network
-
-There is **no native Android/iOS viewer yet** — the viewer is a Windows app, and
-the video is a custom `FrameHeader` + H.264-Annex-B TCP stream. A phone takes part
-in two supported ways:
-
-### A) Use the phone as the network (recommended for ad-hoc demos)
-
-1. Enable the phone's **Mobile Hotspot**.
-2. Connect **both** Windows PCs to that hotspot's Wi-Fi.
-3. Build/run as above. Discovery works because both PCs share the hotspot subnet.
-   (The host's network picker even prefers typical private / `192.168.137.x`
-   hotspot ranges.)
-4. **Caveat:** some phones enable **AP/client isolation**, which blocks PC↔PC
-   traffic and broadcast. If discovery fails on a hotspot, that's usually why —
-   use a normal Wi-Fi router instead, or a PC-hosted hotspot.
-
-### B) Use the phone to verify the host is reachable
-
-From the phone on the same Wi-Fi (using any free network tool app — e.g. PingTools,
-Termux with `nc`, or Fing):
-
-- **Ping** the host IP to confirm L3 reachability.
-- **TCP port check** the control port: `nc -vz <HOST_IP> 50510` (Termux) — a
-  successful connect means the host is reachable and the firewall is open.
-
-This validates the network path only; it will **not** render the screen.
-
-> Future work: a real mobile client would implement the UDP discovery message,
-> the `FrameHeader` framing in `common/protocol.h`, and an H.264 decoder (Android
-> `MediaCodec` / iOS `VideoToolbox`).
-
----
-
-## Automated pipeline self-test
-
-`PipelineTest.exe` exercises the full encode→decode path (DXGI not required): it
-feeds synthetic colour frames through the H.264 encoder and decoder and checks the
-round-tripped colours. No network, no GUI — good for verifying the Media
-Foundation codecs are present on a machine.
-
-```powershell
-cmake --build build --config Release --target PipelineTest
-.\build\Release\PipelineTest.exe
-```
-
-Expected tail:
-
-```
-units=12 keyframes=1 decoded_frames=12
-PASS: encode/decode pipeline + colour conversion OK
-```
-
-A `FAIL: decoder produced no frames` here almost always means the H.264 codec is
-missing (Windows N without the Media Feature Pack).
-
----
-
-## Known limitations / security notes
-
-This is an internal tool and is **not yet hardened**:
-
-- **No encryption** — screen contents *and keystrokes* travel in plaintext TCP.
-  Use only on a trusted LAN until TLS is added.
-- **No authentication** — any viewer on the network that finds the host can
-  connect and watch. Access *grants* (keyboard/mouse) require host or viewer
-  consent, but viewing does not.
-- **Primary monitor only**; no multi-monitor.
-- **No remote cursor overlay** — DXGI captures the desktop without the hardware
-  cursor, so the controller doesn't see the host's pointer.
-- **One viewer at a time.**
-
-These are the priority items before this is "production" for a security context.
-
----
-
-## Troubleshooting quick reference
-
-| Symptom                                   | Likely cause / fix                                            |
-|-------------------------------------------|---------------------------------------------------------------|
-| Viewer finds no servers                   | Host firewall / server not ON / different subnet / AP isolation |
-| Connects but black screen                 | Missing H.264 codec (Windows N → Media Feature Pack)          |
-| Status shows "GDI fallback"               | Normal — DXGI duplication unavailable (hybrid GPU / RDP); it auto-falls back to GDI capture (works, just more CPU). The shown `DXGI 0x…` code is informational |
-| "Screen capture init failed (no DXGI and no GDI)" | Headless/no interactive desktop session                |
-| Build error `LNK1104 ... .exe`            | A previous instance is still running — close it               |
-| Input granted but nothing happens         | Confirm the grant is ON on **both** the host label and viewer indicator |
-```
