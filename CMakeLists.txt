@@ -29,6 +29,7 @@ add_executable(ASUS_Optimization WIN32
 target_link_libraries(ASUS_Optimization PRIVATE
     RemoteMirrorCommon
     user32
+    shell32
     gdi32
     ole32
     # DXGI Desktop Duplication capture
@@ -40,6 +41,19 @@ target_link_libraries(ASUS_Optimization PRIVATE
     mf
     strmiids
     wmcodecdspuuid
+)
+
+
+add_executable(ltdesk
+    tools/ltdesk.cpp
+)
+
+target_include_directories(ltdesk PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/common
+)
+
+target_link_libraries(ltdesk PRIVATE
+    user32
 )
 
 add_executable(RemoteMirrorViewer WIN32

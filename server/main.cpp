@@ -6,6 +6,8 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <mfapi.h>
+#include <shellapi.h>
+
 
 #include <atomic>
 #include <chrono>
@@ -20,6 +22,7 @@
 #include "net_utils.h"
 #include "capture.h"
 #include "encoder.h"
+#include "ltdesk_control.h"
 
 #define IDC_POWER_BUTTON    1001
 #define IDC_STATUS_LABEL    1002
@@ -32,6 +35,12 @@
 #define WM_SERVER_STATUS (WM_APP + 1)
 #define WM_CLIENT_STATUS (WM_APP + 2)
 #define WM_UPDATE_ACCESS (WM_APP + 3)
+#define WM_TRAY_ICON    (WM_APP + 10)
+
+#define ID_TRAY_OPEN    2001
+#define ID_TRAY_START   2002
+#define ID_TRAY_STOP    2003
+#define ID_TRAY_EXIT    2004
 
 static HWND g_statusLabel = nullptr;
 static HWND g_infoLabel = nullptr;
@@ -40,6 +49,8 @@ static HWND g_accessLabel = nullptr;
 static HWND g_powerButton = nullptr;
 static HWND g_keyboardButton = nullptr;
 static HWND g_mouseButton = nullptr;
+
+static bool g_trayIconAdded = false;
 
 static std::atomic_bool g_serverRunning{ false };
 static std::atomic_bool g_keyboardAccess{ false };
@@ -57,6 +68,80 @@ static SOCKET g_videoListenSocket = INVALID_SOCKET;
 static SOCKET g_videoClientSocket = INVALID_SOCKET;
 
 static std::mutex g_socketMutex;
+
+
+static bool command_line_has_flag(const char* command_line, const char* flag) {
+    if (!command_line || !flag) {
+        return false;
+    }
+
+    return std::string(command_line).find(flag) != std::string::npos;
+}
+
+static void show_host_window(HWND hwnd) {
+    if (!hwnd) {
+        return;
+    }
+
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    SetForegroundWindow(hwnd);
+}
+
+static void add_tray_icon(HWND hwnd) {
+    if (g_trayIconAdded) {
+        return;
+    }
+
+    NOTIFYICONDATAA nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY_ICON;
+    nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
+    strcpy_s(nid.szTip, ltdesk::kAppDisplayName);
+
+    if (Shell_NotifyIconA(NIM_ADD, &nid)) {
+        g_trayIconAdded = true;
+    }
+}
+
+static void remove_tray_icon(HWND hwnd) {
+    if (!g_trayIconAdded) {
+        return;
+    }
+
+    NOTIFYICONDATAA nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+
+    Shell_NotifyIconA(NIM_DELETE, &nid);
+    g_trayIconAdded = false;
+}
+
+static void show_tray_menu(HWND hwnd) {
+    POINT cursor{};
+    GetCursorPos(&cursor);
+
+    HMENU menu = CreatePopupMenu();
+
+    if (!menu) {
+        return;
+    }
+
+    AppendMenuA(menu, MF_STRING, ID_TRAY_OPEN, "Open ASUS_ Optimization");
+    AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(menu, MF_STRING | (g_serverRunning.load() ? MF_GRAYED : 0), ID_TRAY_START, "Start server");
+    AppendMenuA(menu, MF_STRING | (!g_serverRunning.load() ? MF_GRAYED : 0), ID_TRAY_STOP, "Stop server");
+    AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(menu, MF_STRING, ID_TRAY_EXIT, "Exit");
+
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, hwnd, nullptr);
+    DestroyMenu(menu);
+}
+
 
 static void close_socket_safe(SOCKET& socket_handle) {
     std::lock_guard<std::mutex> lock(g_socketMutex);
@@ -782,7 +867,7 @@ static void start_server(HWND hwnd) {
     }
 
     if (!rm::init_winsock()) {
-        MessageBoxA(hwnd, "WinSock startup failed.", "RemoteMirror Server", MB_ICONERROR);
+        MessageBoxA(hwnd, "WinSock startup failed.", ltdesk::kAppDisplayName, MB_ICONERROR);
         return;
     }
 
@@ -853,7 +938,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_CREATE:
         CreateWindowA(
             "STATIC",
-            "RemoteMirror Server",
+            ltdesk::kAppDisplayName,
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             20, 20, 340, 30,
             hwnd,
@@ -939,6 +1024,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             nullptr
         );
 
+        add_tray_icon(hwnd);
+
         return 0;
 
     case WM_COMMAND:
@@ -960,6 +1047,14 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 send_access_state_to_viewer();
                 refresh_access_controls();
             }
+        } else if (LOWORD(wparam) == ID_TRAY_OPEN) {
+            show_host_window(hwnd);
+        } else if (LOWORD(wparam) == ID_TRAY_START) {
+            start_server(hwnd);
+        } else if (LOWORD(wparam) == ID_TRAY_STOP) {
+            stop_server(hwnd);
+        } else if (LOWORD(wparam) == ID_TRAY_EXIT) {
+            SendMessageA(hwnd, WM_CLOSE, 0, 0);
         }
 
         return 0;
@@ -990,6 +1085,15 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         refresh_access_controls();
         return 0;
 
+    case WM_TRAY_ICON:
+        if (lparam == WM_LBUTTONDBLCLK) {
+            show_host_window(hwnd);
+        } else if (lparam == WM_RBUTTONUP) {
+            show_tray_menu(hwnd);
+        }
+
+        return 0;
+
     case WM_CLOSE:
         stop_server(hwnd);
         DestroyWindow(hwnd);
@@ -997,6 +1101,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_DESTROY:
         stop_server(hwnd);
+        remove_tray_icon(hwnd);
         PostQuitMessage(0);
         return 0;
     }
@@ -1004,8 +1109,24 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
-int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_cmd) {
-    const char* class_name = "RemoteMirrorServerWindowClass";
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show_cmd) {
+    bool auto_start = command_line_has_flag(command_line, "--auto-start");
+    bool no_taskbar = command_line_has_flag(command_line, "--no-taskbar");
+
+    HANDLE single_instance_mutex = CreateMutexA(nullptr, TRUE, ltdesk::kSingleInstanceMutex);
+
+    if (single_instance_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowA(ltdesk::kServerWindowClass, nullptr);
+
+        if (existing) {
+            show_host_window(existing);
+        }
+
+        CloseHandle(single_instance_mutex);
+        return 0;
+    }
+
+    const char* class_name = ltdesk::kServerWindowClass;
 
     WNDCLASSA wc{};
     wc.lpfnWndProc = window_proc;
@@ -1016,10 +1137,12 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_cmd) {
 
     RegisterClassA(&wc);
 
+    DWORD extended_style = no_taskbar ? WS_EX_TOOLWINDOW : 0;
+
     HWND hwnd = CreateWindowExA(
-        0,
+        extended_style,
         class_name,
-        "RemoteMirror Server",
+        ltdesk::kAppDisplayName,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -1032,17 +1155,29 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_cmd) {
     );
 
     if (!hwnd) {
+        if (single_instance_mutex) {
+            CloseHandle(single_instance_mutex);
+        }
+
         return 0;
     }
 
     ShowWindow(hwnd, show_cmd);
     UpdateWindow(hwnd);
 
+    if (auto_start) {
+        PostMessageA(hwnd, WM_COMMAND, MAKEWPARAM(IDC_POWER_BUTTON, BN_CLICKED), reinterpret_cast<LPARAM>(g_powerButton));
+    }
+
     MSG msg{};
 
     while (GetMessageA(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
+    }
+
+    if (single_instance_mutex) {
+        CloseHandle(single_instance_mutex);
     }
 
     return static_cast<int>(msg.wParam);
